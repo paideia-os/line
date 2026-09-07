@@ -1,0 +1,392 @@
+// src/main.pdx -- line.M1-001 v1.1-A -- retires the STUB body and wires
+// the real sys_open / sys_read / sys_close / sys_open(O_CREAT|O_WRONLY|
+// O_TRUNC) / sys_write / sys_close round-trip.
+//
+// v1.1-A is the syscall-wire landing. The pre-v1.1 M1-001 STUB body
+// was a placeholder that only issued sys_exit(0); no file I/O, no argv
+// consumption, no fingerprint. This file replaces that body with the
+// real four-syscall wire (open+read+close on the read side, open+write+
+// close on the write side, plus a single fd-1 witness write and the
+// terminal sys_exit) so a subsequent boot smoke or shell invocation
+// can confirm each half of the syscall surface actually reaches
+// vfs_{open,read,write,close} in the kernel.
+//
+// v1.1-A intentionally does NOT land:
+//   * The `a i d c p w q Q . , $` command grammar     -- M1-002
+//   * The line-array buffer with 1-based addresses    -- M1-003
+//   * Distinct `w <path>` / `e <path>` command paths  -- M1-004
+//   * The interactive `:` prompt + line reader        -- M1-005
+//   * The `line ok -- lines=<N>` fingerprint          -- M1-006
+//
+// This is a deliberately narrow slice: prove the syscall wire, unblock
+// the shell integration, defer the editor semantics.
+//
+// -----------------------------------------------------------------------
+// Behavior at this landing
+// -----------------------------------------------------------------------
+//
+//   line <path>
+//
+// * argc < 2                      -> "line: usage: line <path>\n" on
+//                                    fd 2, sys_exit(2).
+// * sys_open(path, O_RDONLY, 0)   -> fd >= 0 on success; rax < 0 =>
+//                                    "LINE READ FAIL: open\n" on fd 2,
+//                                    sys_exit(3).
+// * sys_read(fd, buf, 4096)       -> n = bytes read (0 for empty file,
+//                                    treated as success). rax < 0 =>
+//                                    "LINE READ FAIL: read\n" on fd 2,
+//                                    sys_exit(3).
+// * sys_close(fd) after read      -> return ignored (matches BSD `cat`
+//                                    posture; failure would leak a
+//                                    vnode slot but not corrupt state).
+// * sys_write(1, buf, n)          -> echo the buffer to stdout so the
+//                                    caller can visually confirm the
+//                                    read succeeded. Return ignored per
+//                                    the same short-write reasoning as
+//                                    cat.pdx (tty0 backing is length-
+//                                    honoring at R17.M0; no retry loop
+//                                    needed at v1.1-A).
+// * sys_open(path,                -> fd >= 0 on success; rax < 0 =>
+//     O_CREAT|O_WRONLY|O_TRUNC,      "LINE WRITE FAIL: open\n" on fd 2,
+//     0644)                          sys_exit(4).
+// * sys_write(fd, buf, n)         -> rax < 0 => "LINE WRITE FAIL:
+//                                    write\n" on fd 2, sys_exit(4).
+// * sys_close(fd) after write     -> return ignored.
+// * fd-1 witness write            -> "line syscall-wire ok\n" so a
+//                                    boot smoke can grep for the exact
+//                                    v1.1-A phrase. Distinguished from
+//                                    the M1-006 fingerprint `line ok --
+//                                    lines=<N>` on purpose: v1.1-A does
+//                                    not carry a lines counter yet, and
+//                                    a fixture that greps for the M1-
+//                                    006 phrase against v1.1-A output
+//                                    would incorrectly succeed on the
+//                                    stub-shaped `lines=0` case.
+// * sys_exit(0).
+//
+// -----------------------------------------------------------------------
+// SC+ ID discipline (frozen per R17-M1-001 / paideia-os #610)
+// -----------------------------------------------------------------------
+//
+//   0  = sys_read(fd, buf, count)      -> count read, 0 on EOF, or -errno
+//   1  = sys_write(fd, buf, count)     -> count written or -errno
+//   2  = sys_open(path, flags, mode)   -> fd or -errno
+//   3  = sys_close(fd)                 -> 0 or -errno
+//   60 = sys_exit(status)              -> never returns
+//
+// The four values match Linux amd64 syscall numbers by design (see
+// src/user/syscall_shim.pdx and src/user/cat.pdx which use the same
+// ordinals). No syscall_shim link dependency at v1.1-A -- the tool is
+// self-contained, one .pdx / one .elf, matching child_hello.pdx /
+// true.pdx / cat.pdx.
+//
+// -----------------------------------------------------------------------
+// O_flag values
+// -----------------------------------------------------------------------
+//
+//   O_RDONLY = 0                                   -> read-open path
+//   O_WRONLY = 0x01
+//   O_CREAT  = 0x40
+//   O_TRUNC  = 0x200
+//   -> write-open flag word = 0x241                (fits imm32, sign-
+//                                                    extends cleanly)
+//   mode 0644 = 0x1A4                              (fits imm32)
+//
+// All three constants sit well under 0x7FFFFFFF so the cmp/mov imm32
+// paths are safe (no r11 staging needed; the encoder-pitfalls
+// discipline for large immediates is not in play here).
+//
+// -----------------------------------------------------------------------
+// argc / argv contract
+// -----------------------------------------------------------------------
+//
+// argc arrives in rdi, argv in rsi at _start per the frozen execve ABI
+// (design/user/execve-abi.md in the paideia-os monorepo -- registers,
+// not the stack). argv[i] is a char* in this process's own address
+// space; no walker or syscall is needed to dereference it. The path
+// pointer argv[1] is passed unchanged as rdi to sys_open, whose kernel
+// shim performs the walker copy-in.
+//
+// -----------------------------------------------------------------------
+// Register plan
+// -----------------------------------------------------------------------
+//
+//   r12 = fd (current open file; loaded after each sys_open, dead
+//             after each sys_close)
+//   r13 = argc (loaded once from rdi)
+//   r14 = argv base pointer (loaded once from rsi)
+//   r15 = path pointer = argv[1] (loaded once after the argc check)
+//   rbx = bytes-read n (loaded from rax after sys_read; survives the
+//         sys_close + sys_open + sys_write chain unchanged since
+//         syscall preserves callee-save registers)
+//
+// All five registers (r12/r13/r14/r15/rbx) are SysV callee-save. Since
+// _start ends in sys_exit and never returns to a caller, the callee-
+// save contract with the (nonexistent) caller does not apply and no
+// push/pop framing is emitted -- @no_frame is legitimate. Same posture
+// as cat.pdx / echo_client.pdx / true.pdx.
+//
+// -----------------------------------------------------------------------
+// Encoder guardrails (paideia-as v0.36+)
+// -----------------------------------------------------------------------
+//
+// * Reserved label prefix: every branch label in this file is prefixed
+//   `line_` to avoid the reserved-keyword collision with `loop` / `if`
+//   / `else` / `for` / `while` / `match` / `return` (see the paideia-
+//   as reserved-labels feedback note).
+// * No `test reg, reg` mnemonic anywhere; every zero-check is
+//   `cmp reg, 0`.
+// * No `and r11, imm64`; the write-open flag word is a small positive
+//   imm32 loaded directly into rsi.
+// * No 2-op `imul r, imm`; no multiplication anywhere in the body.
+// * No multiline `pub let = "..."`; all rodata strings are single-line.
+// * `mov r64, imm32` for every small immediate (all constants here fit
+//   in a 31-bit positive imm32 so sign-extension is a no-op).
+// * `lea rsi, [rip + <sym>]` for every rodata address load (never a
+//   `mov rsi, imm64` with an unresolved symbol -- the encoder emits
+//   the correct RIP-relative LEA form when handed the symbolic
+//   expression).
+// * Module basename `Main` matches filename `main.pdx` (PascalCase, no
+//   directory prefix) per module-basename-pascal.
+// * `@no_frame` on _start because the body ends in sys_exit and never
+//   returns; no callee-save push/pop needed; no nested SysV `call` in
+//   the body (only `syscall` opcodes) so rsp % 16 == 0 holds
+//   throughout.
+//
+// -----------------------------------------------------------------------
+// Effects / capabilities
+// -----------------------------------------------------------------------
+//
+// {mem, sysreg} covers rodata reads (line_usage_msg / line_ok_msg /
+// line_read_fail_open_msg / line_read_fail_read_msg / line_write_fail_
+// open_msg / line_write_fail_write_msg), scratch writes to line_buf,
+// and every SYSCALL clobber. @{fs, sched} covers the four fs-gated
+// syscalls (sys_read/sys_write/sys_open/sys_close) plus sys_exit's
+// task teardown (same declaration shape as cat.pdx).
+
+module Main = structure {
+
+  // --------------------------------------------------------------------
+  // Scratch buffer -- 4 KiB read chunk, matches sys_read/sys_write's
+  // page-sized transfer sweet spot. Lives in .bss (uninit), aligned to
+  // 8 for the userland scratch convention (never used for u64 stores
+  // in v1.1-A; the alignment is precautionary for later milestones
+  // that will add typed line-index tables here).
+  // --------------------------------------------------------------------
+  pub let mut line_buf : [u8; 4096] = uninit @align(8)
+
+  // --------------------------------------------------------------------
+  // Diagnostic messages (fd 2) + fd-1 witness. All immutable, so they
+  // land in .rodata (bundled into the text PT_LOAD by the default
+  // link script, same posture as cat.pdx's cat_err_prefix / cat_err_
+  // suffix). Every literal is single-line to comply with the encoder's
+  // `pub let = "..."` no-multiline restriction (feedback_pdx_encoder_
+  // pitfalls).
+  //
+  // Lengths are stored as u64 constants alongside each string so the
+  // syscall issuing `mov rdx, <len>` need only load a plain immediate;
+  // avoids a strlen scan on the hot path.
+  // --------------------------------------------------------------------
+  pub let line_usage_msg              : [u8; 26] = "line: usage: line <path>\n\0"
+  pub let line_usage_msg_len          : u64      = 25
+
+  pub let line_read_fail_open_msg     : [u8; 22] = "LINE READ FAIL: open\n\0"
+  pub let line_read_fail_open_msg_len : u64      = 21
+
+  pub let line_read_fail_read_msg     : [u8; 22] = "LINE READ FAIL: read\n\0"
+  pub let line_read_fail_read_msg_len : u64      = 21
+
+  pub let line_write_fail_open_msg    : [u8; 23] = "LINE WRITE FAIL: open\n\0"
+  pub let line_write_fail_open_msg_len: u64      = 22
+
+  pub let line_write_fail_write_msg   : [u8; 24] = "LINE WRITE FAIL: write\n\0"
+  pub let line_write_fail_write_msg_len:u64      = 23
+
+  pub let line_ok_msg                 : [u8; 22] = "line syscall-wire ok\n\0"
+  pub let line_ok_msg_len             : u64      = 21
+
+  // ====================================================================
+  // _start -- user program entry point. Never returns (every terminal
+  // path ends in sys_exit).
+  // ====================================================================
+  pub let _start : () -> () !{mem, sysreg} @{fs, sched} =
+    fn () -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {fs, sched},
+      justification: "line.M1-001 v1.1-A: retires the STUB body (sys_exit(0)-only) and wires the real four-syscall round-trip. Reads argc from rdi and argv from rsi per the frozen execve ABI (design/user/execve-abi.md). Register plan: r12=fd across each open/close pair; r13=argc; r14=argv base; r15=path=argv[1]; rbx=bytes-read n across the sys_close + sys_open(write) + sys_write chain. All five are SysV callee-save so syscall preserves them (syscall clobbers only rax/rcx/r11 by the amd64 fast-syscall convention). Sequence: (1) r13=rdi, r14=rsi. (2) cmp r13,2; jl line_usage_err (argc<2 -> write line_usage_msg to fd 2, sys_exit(2)). (3) r15=[r14+8] (argv[1]). (4) sys_open(r15, 0, 0): rdi=r15, xor rsi,rsi, xor rdx,rdx, mov rax,2, syscall; cmp rax,0; jl line_open_read_err. r12=rax=fd. (5) sys_read(r12, line_buf, 4096): rdi=r12, lea rsi,[rip+line_buf], mov rdx,4096, mov rax,0, syscall; cmp rax,0; jl line_read_err (zero-length read falls through as valid empty-file). rbx=rax=n. (6) sys_close(r12): rdi=r12, mov rax,3, syscall (return ignored per BSD `cat` posture; matches cat.pdx). (7) sys_write(1, line_buf, rbx): rdi=1, lea rsi,[rip+line_buf], mov rdx,rbx, mov rax,1, syscall (return ignored; tty0 is length-honoring at R17.M0). (8) sys_open(r15, 0x241, 0x1A4) for O_CREAT|O_WRONLY|O_TRUNC | mode 0644: rdi=r15, mov rsi,0x241, mov rdx,0x1A4, mov rax,2, syscall; cmp rax,0; jl line_open_write_err. r12=rax=fd. (9) sys_write(r12, line_buf, rbx): rdi=r12, lea rsi,[rip+line_buf], mov rdx,rbx, mov rax,1, syscall; cmp rax,0; jl line_write_err. (10) sys_close(r12): rdi=r12, mov rax,3, syscall (return ignored). (11) fd-1 witness write: sys_write(1, line_ok_msg, 21): rdi=1, lea rsi,[rip+line_ok_msg], mov rdx,21, mov rax,1, syscall. (12) sys_exit(0): xor rdi,rdi, mov rax,60, syscall (never returns). Trailing hlt on every terminal path is defensive belt-and-suspenders for the impossible fallthrough (matches every other _start in the tree). @no_frame because the body ends in sys_exit and never returns to a caller -- the SysV callee-save contract with the nonexistent caller does not apply; matches cat.pdx / echo_client.pdx / true.pdx posture. All labels prefixed line_ per the reserved-label discipline (loop/if/else etc. are keywords). No `test reg,reg`; every zero-check is `cmp reg,0`. No `and r11,imm64`. No 2-op `imul r,imm`. All immediates fit in a 31-bit positive imm32 (0x241=577, 0x1A4=420, 4096, 2, 3, 21, 22, 23, 25, 60) so mov r64,imm32 sign-extends to positive u64 without the errno.pdx §613 MOVABS-verbatim-load hazard. Signed cmp+jl on rax<0 correctly branches on any -errno sentinel (kernel returns 0xFFFF... which is negative signed) and correctly falls through for valid fd / n values (0 <= x). Effects {mem, sysreg} cover rodata reads (line_usage_msg, line_ok_msg, line_read_fail_*_msg, line_write_fail_*_msg), line_buf scratch access, and syscall register state. Capabilities {fs, sched} cover the sys_open/sys_read/sys_write/sys_close surface (declared @{fs} in syscall_shim.pdx for the same access) plus sys_exit's task teardown (@{sched}).",
+      block: {
+        // ---- Step 1: read argc / argv from the frozen execve ABI regs. ----
+        mov r13, rdi;                       // r13 = argc
+        mov r14, rsi;                       // r14 = &argv[0]
+
+        // ---- Step 2: argc < 2 -> usage error, exit 2. ----
+        cmp r13, 2;
+        jl line_usage_err;
+
+        // ---- Step 3: r15 = argv[1] (path). ----
+        mov r15, [r14 + 8];                 // path = argv[1]
+
+        // ---- Step 4: sys_open(path, O_RDONLY=0, mode=0). SC+ ID 2. ----
+        mov rdi, r15;                       // path
+        xor rsi, rsi;                       // flags = O_RDONLY = 0
+        xor rdx, rdx;                       // mode  = 0 (ignored)
+        mov rax, 2;                         // SC+ ID 2 = sys_open
+        syscall;
+        // rax = fd (>= 0) or -errno.
+
+        cmp rax, 0;
+        jl line_open_read_err;
+
+        mov r12, rax;                       // r12 = fd
+
+        // ---- Step 5: sys_read(fd, line_buf, 4096). SC+ ID 0. ----
+        mov rdi, r12;                       // fd
+        lea rsi, [rip + line_buf];          // buf
+        mov rdx, 4096;                      // count
+        mov rax, 0;                         // SC+ ID 0 = sys_read
+        syscall;
+        // rax = n (>= 0) or -errno.
+
+        cmp rax, 0;
+        jl line_read_err;
+
+        mov rbx, rax;                       // rbx = n (bytes read)
+
+        // ---- Step 6: sys_close(fd). SC+ ID 3. Return ignored. ----
+        mov rdi, r12;                       // fd
+        mov rax, 3;                         // SC+ ID 3 = sys_close
+        syscall;
+
+        // ---- Step 7: sys_write(1, line_buf, n). SC+ ID 1. Echo. ----
+        mov rdi, 1;                         // fd = stdout
+        lea rsi, [rip + line_buf];          // buf
+        mov rdx, rbx;                       // count = n
+        mov rax, 1;                         // SC+ ID 1 = sys_write
+        syscall;
+        // Return ignored (tty0 length-honoring at R17.M0).
+
+        // ---- Step 8: sys_open(path, O_CREAT|O_WRONLY|O_TRUNC, 0644). ----
+        mov rdi, r15;                       // path
+        mov rsi, 0x241;                     // O_CREAT|O_WRONLY|O_TRUNC
+        mov rdx, 0x1A4;                     // mode = 0644
+        mov rax, 2;                         // SC+ ID 2 = sys_open
+        syscall;
+        // rax = fd (>= 0) or -errno.
+
+        cmp rax, 0;
+        jl line_open_write_err;
+
+        mov r12, rax;                       // r12 = write-side fd
+
+        // ---- Step 9: sys_write(fd, line_buf, n). SC+ ID 1. ----
+        mov rdi, r12;                       // fd
+        lea rsi, [rip + line_buf];          // buf
+        mov rdx, rbx;                       // count = n (preserved)
+        mov rax, 1;                         // SC+ ID 1 = sys_write
+        syscall;
+        // rax = bytes written or -errno.
+
+        cmp rax, 0;
+        jl line_write_err;
+
+        // ---- Step 10: sys_close(fd). SC+ ID 3. Return ignored. ----
+        mov rdi, r12;                       // fd
+        mov rax, 3;                         // SC+ ID 3 = sys_close
+        syscall;
+
+        // ---- Step 11: fd-1 witness write ("line syscall-wire ok\n"). ----
+        mov rdi, 1;                         // fd = stdout
+        lea rsi, [rip + line_ok_msg];       // buf
+        mov rdx, 21;                        // line_ok_msg_len
+        mov rax, 1;                         // SC+ ID 1 = sys_write
+        syscall;
+
+        // ---- Step 12: sys_exit(0). SC+ ID 60. Never returns. ----
+        xor rdi, rdi;                       // status = 0 (OK)
+        mov rax, 60;                        // SC+ ID 60 = sys_exit
+        syscall;
+
+        // Unreachable. sys_exit does not return; defensive hlt.
+        hlt;
+
+        // ================================================================
+        // Error arms. Each writes its diagnostic to fd 2, then sys_exit
+        // with the exit code documented in the module header. Each is
+        // reached via a single forward branch and falls off the end of
+        // the block through a defensive hlt.
+        // ================================================================
+
+      line_usage_err:
+        mov rdi, 2;                         // fd = stderr
+        lea rsi, [rip + line_usage_msg];    // buf
+        mov rdx, 25;                        // line_usage_msg_len
+        mov rax, 1;                         // SC+ ID 1 = sys_write
+        syscall;
+
+        mov rdi, 2;                         // status = 2 (usage)
+        mov rax, 60;                        // SC+ ID 60 = sys_exit
+        syscall;
+        hlt;
+
+      line_open_read_err:
+        mov rdi, 2;                         // fd = stderr
+        lea rsi, [rip + line_read_fail_open_msg];
+        mov rdx, 21;                        // line_read_fail_open_msg_len
+        mov rax, 1;
+        syscall;
+
+        mov rdi, 3;                         // status = 3 (READ FAIL)
+        mov rax, 60;
+        syscall;
+        hlt;
+
+      line_read_err:
+        // fd is still open at this point (sys_read failed before the
+        // sys_close in step 6). Best-effort close before exiting so
+        // the vnode-pool slot is returned even on the error path.
+        mov rdi, r12;                       // fd
+        mov rax, 3;                         // SC+ ID 3 = sys_close
+        syscall;
+
+        mov rdi, 2;                         // fd = stderr
+        lea rsi, [rip + line_read_fail_read_msg];
+        mov rdx, 21;                        // line_read_fail_read_msg_len
+        mov rax, 1;
+        syscall;
+
+        mov rdi, 3;                         // status = 3 (READ FAIL)
+        mov rax, 60;
+        syscall;
+        hlt;
+
+      line_open_write_err:
+        mov rdi, 2;                         // fd = stderr
+        lea rsi, [rip + line_write_fail_open_msg];
+        mov rdx, 22;                        // line_write_fail_open_msg_len
+        mov rax, 1;
+        syscall;
+
+        mov rdi, 4;                         // status = 4 (WRITE FAIL)
+        mov rax, 60;
+        syscall;
+        hlt;
+
+      line_write_err:
+        // Write-side fd is still open. Best-effort close before exit.
+        mov rdi, r12;                       // fd
+        mov rax, 3;                         // SC+ ID 3 = sys_close
+        syscall;
+
+        mov rdi, 2;                         // fd = stderr
+        lea rsi, [rip + line_write_fail_write_msg];
+        mov rdx, 23;                        // line_write_fail_write_msg_len
+        mov rax, 1;
+        syscall;
+
+        mov rdi, 4;                         // status = 4 (WRITE FAIL)
+        mov rax, 60;
+        syscall;
+        hlt
+      }
+    } @no_frame
+}

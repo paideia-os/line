@@ -1,0 +1,53 @@
+# line -- caps.decl
+#
+# Wave: R63  Milestone: M1  Landing: v1.1-A (syscall-wire)
+# Doc:  design/roadmap/post-r60-daily-use-roadmap.md §R63 in the paideia-os
+#       monorepo. Category C tier-1 per design/tooling/plan.md.
+#
+# This file is the invariant-I6 (capability handoff visible + refusable)
+# manifest the shell validates at exec: `line` receives exactly the caps
+# below and no more.
+#
+# The three caps below are the minimum surface for the v1.1-A syscall
+# wire to (1) read entries from a specific file path only
+# (KIND_PDXFS_FILE narrowed to argv[1] -- no ambient authority on the
+# rest of the filesystem), (2) write the same buffer bytes back to the
+# same path (write mode on the same narrowed cap; the cap grammar
+# accepts a comma-separated mode set per libpdx-cap M2-001), and (3)
+# render diagnostics + the v1.1-A syscall-wire ok witness to the
+# invoker's terminal (KIND_TTY narrowed to write -- no read, no
+# tcsetattr).
+#
+# KIND_USER is NOT requested at v1.1-A. The v1.1-A body performs no
+# audit-record emission and has no owner-column semantics; the user
+# identity surface folds in at M1-005 when the audit shim wires up
+# alongside the interactive command loop (see the parallel shape in
+# umount.pdxfs/caps.decl M3 landing).
+#
+# KIND_IPC_ENDPOINT is NOT requested at v1.1-A. The tool emits no
+# semantic-pipe records; the M1-006 fingerprint is a plain fd-1 byte
+# stream, not a schema-bound wire record. Endpoint requirement lands at
+# a later milestone if/when line grows a schema (unlikely for an ed-
+# shape tool; the roadmap does not currently call for one).
+#
+# Cap narrowing note. Per design/tooling/plan.md §4.4 ("the tool's cap
+# request narrows to exactly the argument path (never ambient
+# authority)"), the KIND_PDXFS_FILE(read+write, <path>) below is a
+# template. The shell's exec-time cap_manifest_verify (libpdx-cap
+# M2-001) binds the concrete argument path when it hands `line` its
+# narrowed cap; the template here is the shape the shell has to
+# satisfy.
+#
+# Missing caps in the received set -> exit 4 (cap denied per I4 in
+# design/tooling/plan.md §4.2). Extra caps -> the shell's
+# cap_manifest_verify refuses at the shell side; `line` never sees them.
+requires:
+  - KIND_TTY(write)
+  - KIND_PDXFS_FILE(read, <arg-path>)
+  - KIND_PDXFS_FILE(write, <arg-path>)
+
+# Declared output schemas. v1.1-A emits no schema-bound records; fd 1
+# carries the raw echoed buffer bytes plus the plain-ASCII
+# `line syscall-wire ok\n` witness. Populated in a later milestone only
+# if line adopts a semantic-pipe record shape.
+declares_output_schemas: []
