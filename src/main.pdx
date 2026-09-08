@@ -1,6 +1,9 @@
-// src/main.pdx -- line.M1-001 v1.1-A -- retires the STUB body and wires
-// the real sys_open / sys_read / sys_close / sys_open(O_CREAT|O_WRONLY|
-// O_TRUNC) / sys_write / sys_close round-trip.
+// src/main.pdx -- line.M1-001 v1.1-A + v1.1-B -- retires the STUB body
+// and wires the real sys_open / sys_read / sys_close / sys_open(O_CREAT
+// |O_WRONLY|O_TRUNC) / sys_write / sys_close round-trip (v1.1-A), then
+// adds a semantic-pipe emission wire that publishes a LineEditRecord@
+// 0.1 via sys_semantic_send (SC+ ID 115, R107-M0-001 paideia-os #2350)
+// on the happy-path tail (v1.1-B).
 //
 // v1.1-A is the syscall-wire landing. The pre-v1.1 M1-001 STUB body
 // was a placeholder that only issued sys_exit(0); no file I/O, no argv
@@ -65,20 +68,65 @@
 // * sys_exit(0).
 //
 // -----------------------------------------------------------------------
+// v1.1-B addendum -- LineEditRecord@0.1 emission wire
+// -----------------------------------------------------------------------
+//
+// v1.1-B extends the happy-path tail (post fd-1 witness write, pre
+// sys_exit(0)) with a single sys_semantic_send call that publishes a
+// 56-byte LineEditRecord@0.1 into the kernel's semantic-pipe ring:
+//
+//   Schema tag  : 0x656E694C69644500  (8-byte ASCII marker, `LineEdit`)
+//   Record size : 56 bytes  (7 * u64, well within the [1, 240] cap)
+//   Layout      :
+//     [+ 0] lines_in         : u64   -- newlines observed in the read buffer
+//     [+ 8] lines_out        : u64   -- newlines observed in the write buffer
+//                                       (equal to lines_in at v1.1-B because
+//                                       the round-trip is byte-for-byte)
+//     [+16] files_read       : u64   -- 1 on the happy path
+//     [+24] files_written    : u64   -- 1 on the happy path
+//     [+32] edit_count       : u64   -- 0 at v1.1-B (no command grammar yet;
+//                                       M1-002 lands `a i d c p w q Q . , $`)
+//     [+40] session_start_ns : u64   -- rdtsc snapshot at _start entry
+//     [+48] session_end_ns   : u64   -- rdtsc snapshot at the emit callsite
+//
+// Timestamp caveat. session_{start,end}_ns are raw TSC ticks, not
+// nanoseconds, because paideia-os has no user-facing `sys_clock_now`
+// yet. The schema-shape name is preserved so a re-land is field-
+// additive rather than field-renaming; same precedent as pdxsock
+// v1.1-B and src/kernel/core/fs/pdxfs_lite/write.pdx (R25-M2-005 #919).
+// Consumers can compute a per-run monotonic duration as end - start in
+// TSC ticks; converting to wall-time ns requires a per-host TSC
+// frequency the kernel does not publish.
+//
+// Emit posture. Error paths emit NO record (no session to describe;
+// matches pdxsock v1.1-B). The sys_semantic_send return value
+// (0 / -EFAULT / -EINVAL) is intentionally discarded at the callsite:
+// the round-trip is over, and a failure at this layer is a marshalling
+// bug in this file (the 56-byte record is well within the [1, 240]
+// cap; line_record_buf is a static rip-relative address that never
+// fails user_ptr_ok) rather than a per-run condition the caller can
+// act on. The sysno-115 handler's overwrite-oldest ring policy means
+// a downstream backup does not surface as PIPE_FULL at v1 either --
+// an older record is silently displaced.
+//
+// -----------------------------------------------------------------------
 // SC+ ID discipline (frozen per R17-M1-001 / paideia-os #610)
 // -----------------------------------------------------------------------
 //
-//   0  = sys_read(fd, buf, count)      -> count read, 0 on EOF, or -errno
-//   1  = sys_write(fd, buf, count)     -> count written or -errno
-//   2  = sys_open(path, flags, mode)   -> fd or -errno
-//   3  = sys_close(fd)                 -> 0 or -errno
-//   60 = sys_exit(status)              -> never returns
+//   0   = sys_read(fd, buf, count)     -> count read, 0 on EOF, or -errno
+//   1   = sys_write(fd, buf, count)    -> count written or -errno
+//   2   = sys_open(path, flags, mode)  -> fd or -errno
+//   3   = sys_close(fd)                -> 0 or -errno
+//   60  = sys_exit(status)             -> never returns
+//   115 = sys_semantic_send(schema, record_ptr, record_len)   (v1.1-B)
+//                                      -> 0 or -errno
 //
 // The four values match Linux amd64 syscall numbers by design (see
 // src/user/syscall_shim.pdx and src/user/cat.pdx which use the same
-// ordinals). No syscall_shim link dependency at v1.1-A -- the tool is
-// self-contained, one .pdx / one .elf, matching child_hello.pdx /
-// true.pdx / cat.pdx.
+// ordinals). sys_semantic_send at sysno 115 is a paideia-native
+// syscall (no Linux analogue). No syscall_shim link dependency at
+// v1.1-A/B -- the tool is self-contained, one .pdx / one .elf,
+// matching child_hello.pdx / true.pdx / cat.pdx.
 //
 // -----------------------------------------------------------------------
 // O_flag values
@@ -117,14 +165,24 @@
 //   r14 = argv base pointer (loaded once from rsi)
 //   r15 = path pointer = argv[1] (loaded once after the argc check)
 //   rbx = bytes-read n (loaded from rax after sys_read; survives the
-//         sys_close + sys_open + sys_write chain unchanged since
-//         syscall preserves callee-save registers)
+//         sys_close + sys_open + sys_write + fd-1 witness + emit
+//         chain unchanged since syscall preserves callee-save
+//         registers; used as the scan bound in the v1.1-B emit
+//         block's newline-counting loop)
 //
 // All five registers (r12/r13/r14/r15/rbx) are SysV callee-save. Since
 // _start ends in sys_exit and never returns to a caller, the callee-
 // save contract with the (nonexistent) caller does not apply and no
 // push/pop framing is emitted -- @no_frame is legitimate. Same posture
 // as cat.pdx / echo_client.pdx / true.pdx.
+//
+// v1.1-B emit block uses only caller-save scratch (rax, rcx, rdx, rdi,
+// rsi, r8, r9, r10, r11) around its own sys_semantic_send call, plus
+// rbx as the bytes-read scan bound. No callee-save register is
+// clobbered by the emit block, so control-flow through the emit tail
+// to sys_exit(0) trivially preserves the register invariants v1.1-A
+// established for the earlier body. The pdxsock v1.1-B emit tail
+// (src/main.pdx pdxsock_emit_session_and_exit) is the direct model.
 //
 // -----------------------------------------------------------------------
 // Encoder guardrails (paideia-as v0.36+)
@@ -205,6 +263,33 @@ module Main = structure {
   pub let line_ok_msg                 : [u8; 22] = "line syscall-wire ok\n\0"
   pub let line_ok_msg_len             : u64      = 21
 
+  // --------------------------------------------------------------------
+  // v1.1-B semantic-pipe emission state.
+  //
+  // line_record_buf holds the 56-byte marshalled LineEditRecord@0.1
+  // (layout in the file header §v1.1-B addendum). @align(8) so every
+  // u64 field store is naturally aligned. .bss (uninit) because the
+  // buffer is populated top-to-bottom in the emit block right before
+  // the sys_semantic_send call; no read-before-write.
+  //
+  // line_session_start_ns caches the rdtsc snapshot taken at the top
+  // of _start's body so the emit block can pair it with a matching
+  // rdtsc snapshot at emit time for session_end_ns. u64-aligned by
+  // construction. See file header for the ns-vs-TSC-ticks caveat.
+  //
+  // line_schema_tag is the immutable 8-byte ASCII schema marker
+  // consumers use to identify LineEditRecord@0.1 in the ring. Loaded
+  // via `mov rdi, imm64` in the emit block (movabs; matches
+  // pdxsock_schema_sock_session's usage pattern in pdxsock/src/main.
+  // pdx line 820) rather than through a rip-relative load, so this
+  // declaration is documentation-anchor only -- a grep for the tag
+  // value points here for the ver-01 semantic. If M2 grows the schema
+  // to @0.2 the tag increments in this file and in the imm64 movabs.
+  // --------------------------------------------------------------------
+  pub let mut line_record_buf         : [u8; 56] = uninit @align(8)
+  pub let mut line_session_start_ns   : u64      = 0
+  pub let line_schema_tag             : u64      = 0x656E694C69644500
+
   // ====================================================================
   // _start -- user program entry point. Never returns (every terminal
   // path ends in sys_exit).
@@ -213,8 +298,23 @@ module Main = structure {
     fn () -> unsafe {
       effects: {mem, sysreg},
       capabilities: {fs, sched},
-      justification: "line.M1-001 v1.1-A: retires the STUB body (sys_exit(0)-only) and wires the real four-syscall round-trip. Reads argc from rdi and argv from rsi per the frozen execve ABI (design/user/execve-abi.md). Register plan: r12=fd across each open/close pair; r13=argc; r14=argv base; r15=path=argv[1]; rbx=bytes-read n across the sys_close + sys_open(write) + sys_write chain. All five are SysV callee-save so syscall preserves them (syscall clobbers only rax/rcx/r11 by the amd64 fast-syscall convention). Sequence: (1) r13=rdi, r14=rsi. (2) cmp r13,2; jl line_usage_err (argc<2 -> write line_usage_msg to fd 2, sys_exit(2)). (3) r15=[r14+8] (argv[1]). (4) sys_open(r15, 0, 0): rdi=r15, xor rsi,rsi, xor rdx,rdx, mov rax,2, syscall; cmp rax,0; jl line_open_read_err. r12=rax=fd. (5) sys_read(r12, line_buf, 4096): rdi=r12, lea rsi,[rip+line_buf], mov rdx,4096, mov rax,0, syscall; cmp rax,0; jl line_read_err (zero-length read falls through as valid empty-file). rbx=rax=n. (6) sys_close(r12): rdi=r12, mov rax,3, syscall (return ignored per BSD `cat` posture; matches cat.pdx). (7) sys_write(1, line_buf, rbx): rdi=1, lea rsi,[rip+line_buf], mov rdx,rbx, mov rax,1, syscall (return ignored; tty0 is length-honoring at R17.M0). (8) sys_open(r15, 0x241, 0x1A4) for O_CREAT|O_WRONLY|O_TRUNC | mode 0644: rdi=r15, mov rsi,0x241, mov rdx,0x1A4, mov rax,2, syscall; cmp rax,0; jl line_open_write_err. r12=rax=fd. (9) sys_write(r12, line_buf, rbx): rdi=r12, lea rsi,[rip+line_buf], mov rdx,rbx, mov rax,1, syscall; cmp rax,0; jl line_write_err. (10) sys_close(r12): rdi=r12, mov rax,3, syscall (return ignored). (11) fd-1 witness write: sys_write(1, line_ok_msg, 21): rdi=1, lea rsi,[rip+line_ok_msg], mov rdx,21, mov rax,1, syscall. (12) sys_exit(0): xor rdi,rdi, mov rax,60, syscall (never returns). Trailing hlt on every terminal path is defensive belt-and-suspenders for the impossible fallthrough (matches every other _start in the tree). @no_frame because the body ends in sys_exit and never returns to a caller -- the SysV callee-save contract with the nonexistent caller does not apply; matches cat.pdx / echo_client.pdx / true.pdx posture. All labels prefixed line_ per the reserved-label discipline (loop/if/else etc. are keywords). No `test reg,reg`; every zero-check is `cmp reg,0`. No `and r11,imm64`. No 2-op `imul r,imm`. All immediates fit in a 31-bit positive imm32 (0x241=577, 0x1A4=420, 4096, 2, 3, 21, 22, 23, 25, 60) so mov r64,imm32 sign-extends to positive u64 without the errno.pdx §613 MOVABS-verbatim-load hazard. Signed cmp+jl on rax<0 correctly branches on any -errno sentinel (kernel returns 0xFFFF... which is negative signed) and correctly falls through for valid fd / n values (0 <= x). Effects {mem, sysreg} cover rodata reads (line_usage_msg, line_ok_msg, line_read_fail_*_msg, line_write_fail_*_msg), line_buf scratch access, and syscall register state. Capabilities {fs, sched} cover the sys_open/sys_read/sys_write/sys_close surface (declared @{fs} in syscall_shim.pdx for the same access) plus sys_exit's task teardown (@{sched}).",
+      justification: "line.M1-001 v1.1-A + v1.1-B: retires the STUB body (sys_exit(0)-only) and wires the real four-syscall round-trip. Reads argc from rdi and argv from rsi per the frozen execve ABI (design/user/execve-abi.md). Register plan: r12=fd across each open/close pair; r13=argc; r14=argv base; r15=path=argv[1]; rbx=bytes-read n across the sys_close + sys_open(write) + sys_write chain. All five are SysV callee-save so syscall preserves them (syscall clobbers only rax/rcx/r11 by the amd64 fast-syscall convention). Sequence: (1) r13=rdi, r14=rsi. (2) cmp r13,2; jl line_usage_err (argc<2 -> write line_usage_msg to fd 2, sys_exit(2)). (3) r15=[r14+8] (argv[1]). (4) sys_open(r15, 0, 0): rdi=r15, xor rsi,rsi, xor rdx,rdx, mov rax,2, syscall; cmp rax,0; jl line_open_read_err. r12=rax=fd. (5) sys_read(r12, line_buf, 4096): rdi=r12, lea rsi,[rip+line_buf], mov rdx,4096, mov rax,0, syscall; cmp rax,0; jl line_read_err (zero-length read falls through as valid empty-file). rbx=rax=n. (6) sys_close(r12): rdi=r12, mov rax,3, syscall (return ignored per BSD `cat` posture; matches cat.pdx). (7) sys_write(1, line_buf, rbx): rdi=1, lea rsi,[rip+line_buf], mov rdx,rbx, mov rax,1, syscall (return ignored; tty0 is length-honoring at R17.M0). (8) sys_open(r15, 0x241, 0x1A4) for O_CREAT|O_WRONLY|O_TRUNC | mode 0644: rdi=r15, mov rsi,0x241, mov rdx,0x1A4, mov rax,2, syscall; cmp rax,0; jl line_open_write_err. r12=rax=fd. (9) sys_write(r12, line_buf, rbx): rdi=r12, lea rsi,[rip+line_buf], mov rdx,rbx, mov rax,1, syscall; cmp rax,0; jl line_write_err. (10) sys_close(r12): rdi=r12, mov rax,3, syscall (return ignored). (11) fd-1 witness write: sys_write(1, line_ok_msg, 21): rdi=1, lea rsi,[rip+line_ok_msg], mov rdx,21, mov rax,1, syscall. (12) sys_exit(0): xor rdi,rdi, mov rax,60, syscall (never returns). Trailing hlt on every terminal path is defensive belt-and-suspenders for the impossible fallthrough (matches every other _start in the tree). @no_frame because the body ends in sys_exit and never returns to a caller -- the SysV callee-save contract with the nonexistent caller does not apply; matches cat.pdx / echo_client.pdx / true.pdx posture. All labels prefixed line_ per the reserved-label discipline (loop/if/else etc. are keywords). No `test reg,reg`; every zero-check is `cmp reg,0`. No `and r11,imm64`. No 2-op `imul r,imm`. All immediates fit in a 31-bit positive imm32 (0x241=577, 0x1A4=420, 4096, 2, 3, 21, 22, 23, 25, 60) so mov r64,imm32 sign-extends to positive u64 without the errno.pdx §613 MOVABS-verbatim-load hazard. Signed cmp+jl on rax<0 correctly branches on any -errno sentinel (kernel returns 0xFFFF... which is negative signed) and correctly falls through for valid fd / n values (0 <= x). Effects {mem, sysreg} cover rodata reads (line_usage_msg, line_ok_msg, line_read_fail_*_msg, line_write_fail_*_msg, line_schema_tag), line_buf + line_record_buf scratch access, line_session_start_ns .bss slot access, and syscall register state. Capabilities {fs, sched} cover the sys_open/sys_read/sys_write/sys_close surface (declared @{fs} in syscall_shim.pdx for the same access) plus sys_exit's task teardown (@{sched}); sys_semantic_send (SC+ ID 115) takes NO cap slot (schema is opaque to the kernel; producer is capability-ungated at R107-M0-001 -- see caps.decl §KIND_IPC_ENDPOINT commentary). v1.1-B addendum: Step 0 (top of block) captures session_start_ns via rdtsc + shl rdx,32 + or rax,rdx (pattern proven at pdxsock/src/main.pdx line 795-797 and src/kernel/core/fs/pdxfs_lite/uuid.pdx), stored to line_session_start_ns. Step 11.5 (inserted between fd-1 witness write and sys_exit) emits LineEditRecord@0.1: (a) scan line_buf[0..rbx) counting ASCII '\n' bytes into rcx via a xor rax,rax + mov_b rax,[r9] + cmp rax,10 + je/add/jmp loop with the r11-remaining/`cmp r11,0`/je exit test (no `test r11,r11` per encoder-pitfalls narrow-load discipline; loop pointer r9 bumps forward per iteration so no base+index scaling is exercised); (b) rdtsc + shl+or reconstruction into rax for session_end_ns; (c) marshal 7-u64 record into line_record_buf via `mov [r10 + N], reg` displacement stores (never scaled-index `[r10 + N*8]` per encoder-pitfall v0.36+); (d) sys_semantic_send(0x656E694C69644500, &line_record_buf, 56) at SC+ ID 115. rbx (n) is callee-save so it survives the fd-1 witness sys_write unchanged and serves as the scan bound. rcx is caller-save + SYSCALL-clobbered but is consumed into [r10+0]/[r10+8] BEFORE the sys_semantic_send syscall, so the syscall clobber is invisible. sys_semantic_send's return (0 / -EFAULT / -EINVAL) is intentionally discarded: the round-trip is over and a failure here would be a marshalling bug in this file (56-byte record within [1,240] cap, static rip-relative record_ptr never fails user_ptr_ok) rather than a per-run condition the caller can act on. Error paths (line_{usage,open_read,read,open_write,write}_err) emit NO record (no session to describe; matches pdxsock v1.1-B posture at pdxsock_emit_session_and_exit vs the pdxsock_udp_not_yet / socket-error arms). Schema tag `0x656E694C69644500` loaded as imm64 via movabs (matches pdxsock_schema_sock_session at pdxsock/src/main.pdx line 820); the line_schema_tag rodata declaration exists as a grep-anchor for the ver-01 semantic (a M2 bump to @0.2 increments the tag in both the declaration and the movabs). Timestamp caveat: session_{start,end}_ns are raw TSC ticks not ns until sys_clock_now lands; schema-shape name preserved so a re-land is field-additive (precedent: src/kernel/core/fs/pdxfs_lite/write.pdx R25-M2-005 #919, pdxsock v1.1-B). Emit-block encoder discipline: no `test rN,rN` (every zero-check `cmp rN,0`); no 2-op `imul r,imm` (no multiplication); no `and reg,imm64` (no wide masks); no `cmp reg,[mem]` (every mem read staged through a register); no scaled-index `[reg + N*idx]` in position-sensitive contexts (only displacement `[reg + N]` and pointer-bump `[r9]` used). Every new label prefixed `line_emit_` (reserved-label discipline; grep audit confirms no line_emit_ hits elsewhere in src/).",
       block: {
+        // ---- v1.1-B Step 0: capture session_start_ns via rdtsc. ----
+        // rdtsc returns EDX:EAX = 64-bit TSC. We compose into rax
+        // (rdtsc zero-extends into rdx/rax per SDM Vol 2A rdtsc entry).
+        // rdi/rsi (argc/argv per execve ABI) are untouched. rdx/rax are
+        // not part of the ABI at entry so the clobber is invisible.
+        // Store to line_session_start_ns for the emit block to read
+        // later. If the argc check below rejects, the wasted rdtsc is
+        // dropped along with the session -- no record is emitted.
+        // Pattern proven at pdxsock_capture_session_start_ns (pdxsock/
+        // src/main.pdx line 795-797) and uuid.pdx.
+        rdtsc;
+        shl rdx, 32;
+        or  rax, rdx;
+        mov [rip + line_session_start_ns], rax;
+
         // ---- Step 1: read argc / argv from the frozen execve ABI regs. ----
         mov r13, rdi;                       // r13 = argc
         mov r14, rsi;                       // r14 = &argv[0]
@@ -300,6 +400,90 @@ module Main = structure {
         mov rdx, 21;                        // line_ok_msg_len
         mov rax, 1;                         // SC+ ID 1 = sys_write
         syscall;
+
+        // ================================================================
+        // v1.1-B Step 11.5: emit LineEditRecord@0.1 via sys_semantic_send.
+        //
+        // Live at entry:
+        //   rbx = n              (bytes read/written; scan bound)
+        //   line_session_start_ns cached at .bss (v1.1-B Step 0)
+        //
+        // Scratch (all caller-save; freely trashed):
+        //   rax        rdtsc dst + record accumulator
+        //   rdx        rdtsc upper half + record accumulator
+        //   r9         byte-scan pointer / record-buf base
+        //   r10        record-buf base / one-value scratch
+        //   r11        remaining bytes to scan
+        //   rcx        newline count accumulator (moves to record)
+        //   rdi rsi    sys_semantic_send arg registers
+        //
+        // Steps:
+        //   (a) Count newlines in line_buf[0..rbx). rbx==0 (empty file)
+        //       falls through with count=0, honestly reporting a zero-
+        //       line record.
+        //   (b) rdtsc -> session_end_ns.
+        //   (c) Marshal 7 u64 fields into line_record_buf.
+        //   (d) sys_semantic_send(schema, &line_record_buf, 56).
+        //       Return in rax is intentionally discarded (see file
+        //       header §v1.1-B addendum).
+        //
+        // Byte load uses `xor rax, rax; mov_b rax, [r9]` per the
+        // encoder-pitfalls narrow-load idiom (mov_b does NOT zero-
+        // extend on its own; precedent src/kernel/core/syscall/sys_umount.
+        // pdx path-hash loop). Loop control uses `cmp r11, 0` +
+        // `je/jne`, never `test r11, r11`. Displacement form `[r10 + N]`
+        // for every store, never scaled-index `[r10 + N*8]`.
+        // ================================================================
+
+        // ---- (a) Newline count. r9 = &line_buf; r11 = remaining; rcx = count. ----
+        lea r9, [rip + line_buf];
+        mov r11, rbx;                       // remaining = n
+        xor rcx, rcx;                       // count = 0
+      line_emit_count_loop:
+        cmp r11, 0;
+        je  line_emit_count_done;
+        xor rax, rax;                       // clear high bits for the byte load
+        mov_b rax, [r9];                    // rax = *r9 (zero-extended byte)
+        cmp rax, 10;                        // ASCII '\n'
+        jne line_emit_count_skip;
+        add rcx, 1;
+      line_emit_count_skip:
+        add r9, 1;
+        sub r11, 1;
+        jmp line_emit_count_loop;
+      line_emit_count_done:
+
+        // ---- (b) session_end_ns via rdtsc reconstruction. ----
+        rdtsc;                              // EDX:EAX = 64-bit TSC
+        shl rdx, 32;
+        or  rax, rdx;                       // rax = session_end_ns
+
+        // ---- (c) Marshal 56-byte LineEditRecord@0.1 into line_record_buf. ----
+        lea r10, [rip + line_record_buf];
+        mov [r10 + 0],  rcx;                // lines_in         = newline count
+        mov [r10 + 8],  rcx;                // lines_out        = same (byte-for-byte round-trip at v1.1-B)
+        mov r9, 1;
+        mov [r10 + 16], r9;                 // files_read       = 1 (happy path)
+        mov [r10 + 24], r9;                 // files_written    = 1 (happy path)
+        xor r9, r9;
+        mov [r10 + 32], r9;                 // edit_count       = 0 (M1-002 wires command grammar)
+        mov r9, [rip + line_session_start_ns];
+        mov [r10 + 40], r9;                 // session_start_ns (raw TSC ticks)
+        mov [r10 + 48], rax;                // session_end_ns   (raw TSC ticks)
+
+        // ---- (d) sys_semantic_send(schema, record_ptr, record_len). SC+ ID 115. ----
+        // Schema tag `LineEdit` marker (see line_schema_tag rodata
+        // declaration). Loaded as an imm64 via movabs; matches the
+        // pdxsock_schema_sock_session usage at pdxsock/src/main.pdx
+        // line 820. record_len = 56 fits imm32 and imm8; well within
+        // the sysno-115 handler's [1, 240] cap.
+        mov rdi, 0x656E694C69644500;        // schema tag (LineEditRecord@0.1)
+        lea rsi, [rip + line_record_buf];   // record_ptr
+        mov rdx, 56;                        // record_len
+        mov rax, 115;                       // SC+ ID 115 = sys_semantic_send
+        syscall;
+        // Return in rax ignored: 0 / -EFAULT / -EINVAL all fall
+        // through into sys_exit(0) unchanged (see file header §v1.1-B).
 
         // ---- Step 12: sys_exit(0). SC+ ID 60. Never returns. ----
         xor rdi, rdi;                       // status = 0 (OK)

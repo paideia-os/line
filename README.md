@@ -4,17 +4,28 @@ An `ed`-style scriptable line editor for PaideiaOS. Category C tier-1 per
 `design/tooling/plan.md` in the paideia-os monorepo. Roadmap wave R63,
 milestone M1 per `design/roadmap/post-r60-daily-use-roadmap.md` §R63.
 
-## Status (v1.1-A)
+## Status (v1.1-B)
 
-`v1.1-A` is the syscall-wire landing: `M1-001`'s STUB body is retired and
-`_start` now drives a real `sys_open` / `sys_read` / `sys_close` /
-`sys_open(O_CREAT|O_WRONLY|O_TRUNC)` / `sys_write` / `sys_close`
-round-trip over a single positional argument. The tool at this landing
-reads the argument file into a 4 KiB in-memory buffer, echoes the bytes
-to `stdout` so the caller can see the read succeeded, then writes the
-same bytes back to the argument path (touch-write) to prove the write
-half of the wire. No command grammar, no address parser, no
-buffer-edit ops -- those land at `M1-002` / `M1-003` per the roadmap.
+`v1.1-B` is the semantic-pipe emission wire: on the successful
+round-trip tail, `_start` now emits a 56-byte `LineEditRecord@0.1`
+(schema tag `0x656E694C69644500`) via `sys_semantic_send` (SC+ ID 115,
+R107-M0-001) carrying `{lines_in, lines_out, files_read,
+files_written, edit_count, session_start_ns, session_end_ns}` before
+`sys_exit(0)`. Timestamps are raw `rdtsc` TSC ticks until
+`sys_clock_now` lands; `edit_count == 0` always at v1.1-B (no command
+grammar yet); `lines_out == lines_in` because the round-trip is
+byte-for-byte. Error paths emit no record. See `STATUS.md`
+§"v1.1-B honest-scope" for the full field-level caveat table.
+
+`v1.1-A` (previous) is the syscall-wire landing: `M1-001`'s STUB body
+was retired and `_start` drove the `sys_open` / `sys_read` /
+`sys_close` / `sys_open(O_CREAT|O_WRONLY|O_TRUNC)` / `sys_write` /
+`sys_close` round-trip over a single positional argument. The tool
+reads the argument file into a 4 KiB in-memory buffer, echoes the
+bytes to `stdout`, then writes the same bytes back to the argument
+path (touch-write) to prove the write half of the wire. No command
+grammar, no address parser, no buffer-edit ops -- those land at
+`M1-002` / `M1-003` per the roadmap.
 
 ## Behavior
 
@@ -30,13 +41,20 @@ buffer-edit ops -- those land at `M1-002` / `M1-003` per the roadmap.
   write-open -> `LINE WRITE FAIL: open\n` to fd 2, exit 4.
 * `sys_write(fd, buf, n)` fails -> `LINE WRITE FAIL: write\n` to fd 2,
   exit 4.
-* Happy path -> `line syscall-wire ok\n` to fd 1, `sys_exit(0)`.
+* Happy path -> `line syscall-wire ok\n` to fd 1, then (v1.1-B)
+  `sys_semantic_send(0x656E694C69644500, &record, 56)` emits a
+  `LineEditRecord@0.1` into the kernel's semantic-pipe ring, then
+  `sys_exit(0)`.
 
 The `line syscall-wire ok` fingerprint is a v1.1-A-specific witness
 that both syscall halves executed. The R63.M1-006 fingerprint
 `line ok -- lines=<N>` and the four canonical error markers
 (`LINE READ FAIL`, `LINE WRITE FAIL`, `LINE PARSE FAIL`) land in their
 final shape when the interactive command loop wires up at M1-005.
+The v1.1-B `LineEditRecord@0.1` publication is independent of both
+the plain-ASCII fingerprint and the error markers: it is a
+schema-bound sidecar for downstream `postui-*`-shape tools rather
+than a human-readable line.
 
 ## Non-goals (deferred)
 
@@ -48,9 +66,9 @@ final shape when the interactive command loop wires up at M1-005.
 
 ## Layout
 
-* `src/main.pdx` -- `Main::_start`, the single-file v1.1-A entry point.
-  Grows into per-concern modules (`Argv`, `Buffer`, `Dispatch`, ...) as
-  later milestones land.
+* `src/main.pdx` -- `Main::_start`, the single-file v1.1-A/B entry
+  point. Grows into per-concern modules (`Argv`, `Buffer`, `Dispatch`,
+  `Emit`, ...) as later milestones land.
 * `manifest.pdxproj` -- `paideia-as build` manifest; the M1 build
   produces a single ELF at `build-out/line`.
 * `caps.decl` -- capability manifest consumed by the shell's
