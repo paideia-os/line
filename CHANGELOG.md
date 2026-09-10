@@ -4,7 +4,18 @@ All notable changes to `paideia-os/line` (ed-clone editor) documented per Keep-a
 
 ## [Unreleased]
 
-_No unreleased changes — v1.1.0 is the current tag._
+### Added
+
+- **v1.1-D** (issue #6) — R63.M1-006 fingerprint `line ok -- lines=<N>\n`
+  on the happy-path tail (three sys_writes to fd 1: prefix +
+  `line_print_u64_dec` decimal + newline). Retires the v1.1-A witness
+  phrase `line syscall-wire ok\n`. Newline count is computed once
+  (byte-scan of `line_buf[0..n]` into r13, SysV callee-save) and
+  carried through the fingerprint AND the v1.1-B semantic-pipe
+  marshalling — the pre-v1.1-D duplicate count loop inside the emit
+  block is retired. `LINE PARSE FAIL\n` rodata declared (unwired;
+  parser lands at M1-002/M1-005). Exit-status inventory frozen at
+  {0=OK, 2=usage, 3=READ FAIL, 4=WRITE FAIL, 5=PARSE FAIL reserved}.
 
 ## [1.1.0] - 2026-09-08
 

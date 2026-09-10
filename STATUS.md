@@ -3,10 +3,12 @@
 **Wave:** R63 (user-space `ed`-style scriptable line editor -- paideia-os
 `design/roadmap/post-r60-daily-use-roadmap.md` §R63; Category C tier-1
 per `design/tooling/plan.md`).
-**Current milestone:** v1.1-B (semantic-pipe emission wire:
-`LineEditRecord@0.1` via `sys_semantic_send` SC+ ID 115) -- **landed**.
-Previous: v1.1-A (syscall-wire; retired the M1-001 STUB body) -- landed.
-**Version:** 1.1.0-B (pre-tag; a signed 1.0.0 release closes at M5).
+**Current milestone:** v1.1-D (R63.M1-006 fingerprint `line ok --
+lines=<N>\n` + LINE PARSE FAIL rodata marker) -- **landed**.
+Previous: v1.1-B (semantic-pipe emission wire: `LineEditRecord@0.1`
+via `sys_semantic_send` SC+ ID 115) -- landed. v1.1-A (syscall-wire;
+retired the M1-001 STUB body) -- landed.
+**Version:** 1.1.0-D (pre-tag; a signed 1.0.0 release closes at M5).
 
 ## Milestone checklist
 
@@ -15,9 +17,9 @@ Previous: v1.1-A (syscall-wire; retired the M1-001 STUB body) -- landed.
 - [x] **M1-001** (v1.1-A) -- retired the STUB body; wired
       `sys_open` / `sys_read` / `sys_close` (read side) plus
       `sys_open(O_CREAT|O_WRONLY|O_TRUNC)` / `sys_write` / `sys_close`
-      (write side); happy path emits the fd-1 witness
-      `line syscall-wire ok\n` before `sys_exit(0)`. Landed at
-      3edfa6f.
+      (write side); happy path emitted the fd-1 witness
+      `line syscall-wire ok\n` before `sys_exit(0)` (retired at
+      v1.1-D). Landed at 3edfa6f.
 - [x] **v1.1-B** -- semantic-pipe emission wire:
       `LineEditRecord@0.1` (56 bytes, schema tag
       `0x656E694C69644500` -- 8-byte ASCII `LineEdit` marker) emitted
@@ -39,10 +41,25 @@ Previous: v1.1-A (syscall-wire; retired the M1-001 STUB body) -- landed.
 - [ ] **M1-004** -- distinct `w <path>` / `e <path>` command paths.
       `files_read` / `files_written` start reporting real counts here
       once multiple files can be opened in one session.
-- [ ] **M1-005** -- interactive `:` prompt + line reader.
-- [ ] **M1-006** -- `line ok -- lines=<N>` fingerprint on `q` (final
-      shape; distinct from the v1.1-A `line syscall-wire ok\n`
-      witness).
+- [ ] **M1-005** -- interactive `:` prompt + line reader. Wires the
+      `LINE PARSE FAIL` marker declared at v1.1-D.
+- [x] **M1-006** (v1.1-D) -- `line ok -- lines=<N>\n` fingerprint on
+      the happy-path tail (three sys_writes to fd 1: prefix
+      `line ok -- lines=` + variable decimal via `line_print_u64_dec`
+      + newline). Newline count computed once (byte-scan of
+      `line_buf[0..n]`) and held in r13 (SysV callee-save; repurposed
+      after Step 2 argc-check), carried through the fingerprint AND
+      the v1.1-B semantic-pipe marshalling -- the pre-v1.1-D
+      duplicate count loop inside the emit block is retired.
+      Retires the v1.1-A witness phrase `line syscall-wire ok\n`.
+      `LINE PARSE FAIL\n` rodata declared here so the M1-005 body-
+      edit wave is pure body-edit (no rodata churn). Empty input
+      emits `line ok -- lines=0\n` via the helper's single-'0' fast-
+      path. Error paths emit NO fingerprint. Exit-status inventory
+      frozen: 0=OK, 2=usage, 3=READ FAIL, 4=WRITE FAIL, 5=PARSE FAIL
+      (reserved). `q` command not yet in play (the fingerprint fires
+      at the round-trip tail today; will move to the `q` handler at
+      M1-005 without a wire-format change).
 
 ### M2 -- (deferred) module split + libpdx-audit
 

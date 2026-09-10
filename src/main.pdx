@@ -1,9 +1,12 @@
-// src/main.pdx -- line.M1-001 v1.1-A + v1.1-B -- retires the STUB body
-// and wires the real sys_open / sys_read / sys_close / sys_open(O_CREAT
-// |O_WRONLY|O_TRUNC) / sys_write / sys_close round-trip (v1.1-A), then
-// adds a semantic-pipe emission wire that publishes a LineEditRecord@
-// 0.1 via sys_semantic_send (SC+ ID 115, R107-M0-001 paideia-os #2350)
-// on the happy-path tail (v1.1-B).
+// src/main.pdx -- line.M1-001 v1.1-A + v1.1-B + v1.1-D --
+// retires the STUB body and wires the real sys_open / sys_read /
+// sys_close / sys_open(O_CREAT|O_WRONLY|O_TRUNC) / sys_write /
+// sys_close round-trip (v1.1-A), adds a semantic-pipe emission wire
+// that publishes a LineEditRecord@0.1 via sys_semantic_send (SC+ ID
+// 115, R107-M0-001 paideia-os #2350) on the happy-path tail (v1.1-B),
+// and lands the R63.M1-006 fingerprint + PARSE FAIL rodata marker
+// (v1.1-D). The v1.1-A witness phrase `line syscall-wire ok\n` is
+// retired in favor of the M1-006 fingerprint `line ok -- lines=<N>\n`.
 //
 // v1.1-A is the syscall-wire landing. The pre-v1.1 M1-001 STUB body
 // was a placeholder that only issued sys_exit(0); no file I/O, no argv
@@ -14,12 +17,11 @@
 // can confirm each half of the syscall surface actually reaches
 // vfs_{open,read,write,close} in the kernel.
 //
-// v1.1-A intentionally does NOT land:
+// v1.1-A/B intentionally did NOT land (M1-006 now lands at v1.1-D):
 //   * The `a i d c p w q Q . , $` command grammar     -- M1-002
 //   * The line-array buffer with 1-based addresses    -- M1-003
 //   * Distinct `w <path>` / `e <path>` command paths  -- M1-004
 //   * The interactive `:` prompt + line reader        -- M1-005
-//   * The `line ok -- lines=<N>` fingerprint          -- M1-006
 //
 // This is a deliberately narrow slice: prove the syscall wire, unblock
 // the shell integration, defer the editor semantics.
@@ -48,32 +50,35 @@
 //                                    the same short-write reasoning as
 //                                    cat.pdx (tty0 backing is length-
 //                                    honoring at R17.M0; no retry loop
-//                                    needed at v1.1-A).
+//                                    needed).
 // * sys_open(path,                -> fd >= 0 on success; rax < 0 =>
 //     O_CREAT|O_WRONLY|O_TRUNC,      "LINE WRITE FAIL: open\n" on fd 2,
 //     0644)                          sys_exit(4).
 // * sys_write(fd, buf, n)         -> rax < 0 => "LINE WRITE FAIL:
 //                                    write\n" on fd 2, sys_exit(4).
 // * sys_close(fd) after write     -> return ignored.
-// * fd-1 witness write            -> "line syscall-wire ok\n" so a
-//                                    boot smoke can grep for the exact
-//                                    v1.1-A phrase. Distinguished from
-//                                    the M1-006 fingerprint `line ok --
-//                                    lines=<N>` on purpose: v1.1-A does
-//                                    not carry a lines counter yet, and
-//                                    a fixture that greps for the M1-
-//                                    006 phrase against v1.1-A output
-//                                    would incorrectly succeed on the
-//                                    stub-shaped `lines=0` case.
+// * fd-1 fingerprint (v1.1-D)     -> "line ok -- lines=<N>\n" emitted
+//                                    to fd 1 as three sys_write calls
+//                                    (prefix + variable decimal via
+//                                    line_print_u64_dec + newline).
+//                                    <N> is the ASCII-'\n' count over
+//                                    line_buf[0..rbx). Retires the
+//                                    v1.1-A witness phrase "line
+//                                    syscall-wire ok\n" per R63.M1-006.
+//                                    Empty input (rbx==0) emits "line
+//                                    ok -- lines=0\n" via the helper's
+//                                    single-'0' fast-path. Error paths
+//                                    emit NO fingerprint (they emit
+//                                    their per-cause marker only).
 // * sys_exit(0).
 //
 // -----------------------------------------------------------------------
 // v1.1-B addendum -- LineEditRecord@0.1 emission wire
 // -----------------------------------------------------------------------
 //
-// v1.1-B extends the happy-path tail (post fd-1 witness write, pre
-// sys_exit(0)) with a single sys_semantic_send call that publishes a
-// 56-byte LineEditRecord@0.1 into the kernel's semantic-pipe ring:
+// v1.1-B extends the happy-path tail (post fingerprint, pre sys_exit)
+// with a single sys_semantic_send call that publishes a 56-byte
+// LineEditRecord@0.1 into the kernel's semantic-pipe ring:
 //
 //   Schema tag  : 0x656E694C69644500  (8-byte ASCII marker, `LineEdit`)
 //   Record size : 56 bytes  (7 * u64, well within the [1, 240] cap)
@@ -110,6 +115,71 @@
 // an older record is silently displaced.
 //
 // -----------------------------------------------------------------------
+// v1.1-D addendum -- R63.M1-006 fingerprint + PARSE FAIL rodata marker
+// -----------------------------------------------------------------------
+//
+// v1.1-D lands the R63.M1-006 success fingerprint in its final shape:
+//
+//   line ok -- lines=<N>\n
+//
+// emitted to fd 1 via three sys_write calls (prefix + decimal digits
+// via line_print_u64_dec + newline). <N> is the count of ASCII-'\n'
+// bytes in line_buf[0..rbx), computed in a byte-scan loop that runs
+// once, before the fingerprint write. The count is held in r13 (SysV
+// callee-save; repurposed after Step 2's argc-check consumes it) so
+// it survives all three sys_write syscalls plus the intervening
+// `call line_print_u64_dec`, and reaches the v1.1-B semantic-pipe
+// marshalling block unchanged. The v1.1-B block's own duplicate
+// newline-count loop is retired at v1.1-D: lines_in and lines_out
+// both read from r13 at Step 11.5(c) instead of recomputing.
+//
+// The three canonical error markers required by M1-006 are:
+//
+//   LINE READ FAIL   -- wired at v1.1-A as `LINE READ FAIL: open\n`
+//                       (line_open_read_err, exit 3) and `LINE READ
+//                       FAIL: read\n` (line_read_err, exit 3).
+//   LINE WRITE FAIL  -- wired at v1.1-A as `LINE WRITE FAIL: open\n`
+//                       (line_open_write_err, exit 4) and `LINE WRITE
+//                       FAIL: write\n` (line_write_err, exit 4).
+//   LINE PARSE FAIL  -- rodata declared at v1.1-D (line_parse_fail_msg,
+//                       "LINE PARSE FAIL\n"). NOT YET WIRED. The
+//                       parser body lands at M1-002 (command grammar)
+//                       and M1-005 (interactive `:` prompt + argument
+//                       parsing), at which point a per-parse-error
+//                       branch will `lea rsi, [rip + line_parse_fail_
+//                       msg]` and `sys_exit(5)`. Declaring the rodata
+//                       here so the M1-002/M1-005 wave is pure body-
+//                       edit (no rodata churn).
+//
+// Exit-status inventory (frozen at v1.1-D):
+//   0 = OK (happy-path tail after fingerprint + semantic-pipe emit)
+//   2 = usage (argc < 2)
+//   3 = LINE READ FAIL  (open failed OR read failed)
+//   4 = LINE WRITE FAIL (open failed OR write failed)
+//   5 = LINE PARSE FAIL (reserved; wires at M1-002/M1-005)
+//
+// line_print_u64_dec is a verbatim adaptation of dm_print_u64_dec
+// (src/user/dmesg.pdx §dm_print_u64_dec) / cp_print_u64_dec
+// (src/user/cp.pdx §cp_print_u64_dec, itself adapted from ps.pdx /
+// init.pdx print_u64_dec, R17-M2-736 D12 / #736), routed through
+// sys_write to fd 1 (SC+ ID 1) instead of sys_debug_puts (SC+ ID 12).
+// The channel switch is deliberate: the v1.1-A witness phrase already
+// rode fd 1, so the retiring fingerprint rides the same channel for
+// grep-continuity with any smoke fixture that greps stdout. Every
+// downstream reader tools/run-*.sh already reads fd 1 for the round-
+// trip echo. @no_frame with self-managed 24-byte stack scratch
+// (`sub rsp, 24` / `add rsp, 24`) matching the dmesg / cp posture.
+//
+// Alignment. _start is @no_frame with no push/pop, so rsp % 16 == 0
+// at every `call line_print_u64_dec` site (PVH loader contract:
+// entry rsp % 16 == 0, matching cat.pdx / dmesg.pdx / cp.pdx). After
+// `call` pushes 8 bytes and the helper does `sub rsp, 24`, the total
+// is 32, keeping rsp % 16 == 0. The syscall opcode does not require
+// 16-byte alignment anyway, so even a 24-byte scratch (rsp % 16 == 8
+// after sub) would be safe -- the 24-not-16 choice tracks the dmesg /
+// cp precedent so this file inherits their verification story.
+//
+// -----------------------------------------------------------------------
 // SC+ ID discipline (frozen per R17-M1-001 / paideia-os #610)
 // -----------------------------------------------------------------------
 //
@@ -125,8 +195,8 @@
 // src/user/syscall_shim.pdx and src/user/cat.pdx which use the same
 // ordinals). sys_semantic_send at sysno 115 is a paideia-native
 // syscall (no Linux analogue). No syscall_shim link dependency at
-// v1.1-A/B -- the tool is self-contained, one .pdx / one .elf,
-// matching child_hello.pdx / true.pdx / cat.pdx.
+// v1.1-A/B/D -- the tool is self-contained, one .pdx / one .elf,
+// matching child_hello.pdx / true.pdx / cat.pdx / dmesg.pdx.
 //
 // -----------------------------------------------------------------------
 // O_flag values
@@ -161,42 +231,52 @@
 //
 //   r12 = fd (current open file; loaded after each sys_open, dead
 //             after each sys_close)
-//   r13 = argc (loaded once from rdi)
+//   r13 = argc at Step 1-2 (consumed by argc-check); REPURPOSED at
+//         Step 10.5+ to hold the newline count computed once and
+//         carried through the fingerprint sys_writes + `call line_
+//         print_u64_dec` + v1.1-B semantic-pipe marshalling (callee-
+//         save, survives all intervening syscalls / call)
 //   r14 = argv base pointer (loaded once from rsi)
 //   r15 = path pointer = argv[1] (loaded once after the argc check)
 //   rbx = bytes-read n (loaded from rax after sys_read; survives the
-//         sys_close + sys_open + sys_write + fd-1 witness + emit
-//         chain unchanged since syscall preserves callee-save
-//         registers; used as the scan bound in the v1.1-B emit
-//         block's newline-counting loop)
+//         sys_close + sys_open + sys_write + newline-scan + fingerprint
+//         + emit chain unchanged since syscall preserves callee-save
+//         registers; used as the scan bound in the v1.1-D newline
+//         count loop)
 //
 // All five registers (r12/r13/r14/r15/rbx) are SysV callee-save. Since
 // _start ends in sys_exit and never returns to a caller, the callee-
 // save contract with the (nonexistent) caller does not apply and no
 // push/pop framing is emitted -- @no_frame is legitimate. Same posture
-// as cat.pdx / echo_client.pdx / true.pdx.
+// as cat.pdx / echo_client.pdx / true.pdx / dmesg.pdx.
 //
-// v1.1-B emit block uses only caller-save scratch (rax, rcx, rdx, rdi,
-// rsi, r8, r9, r10, r11) around its own sys_semantic_send call, plus
-// rbx as the bytes-read scan bound. No callee-save register is
-// clobbered by the emit block, so control-flow through the emit tail
-// to sys_exit(0) trivially preserves the register invariants v1.1-A
-// established for the earlier body. The pdxsock v1.1-B emit tail
-// (src/main.pdx pdxsock_emit_session_and_exit) is the direct model.
+// v1.1-B/D emit tail uses only caller-save scratch (rax, rcx, rdx,
+// rdi, rsi, r8, r9, r10, r11) around its own sys_semantic_send call,
+// plus r13 as the newline count (callee-save) and rbx as the bytes-
+// read scan bound. No callee-save register is clobbered by the emit
+// block, so control-flow through the emit tail to sys_exit(0)
+// trivially preserves the register invariants v1.1-A established for
+// the earlier body. The pdxsock v1.1-B emit tail (src/main.pdx
+// pdxsock_emit_session_and_exit) is the direct model.
 //
 // -----------------------------------------------------------------------
 // Encoder guardrails (paideia-as v0.36+)
 // -----------------------------------------------------------------------
 //
 // * Reserved label prefix: every branch label in this file is prefixed
-//   `line_` to avoid the reserved-keyword collision with `loop` / `if`
-//   / `else` / `for` / `while` / `match` / `return` (see the paideia-
-//   as reserved-labels feedback note).
+//   `line_` (or `line_emit_` / `line_pud_` within the v1.1-B emit
+//   block and the line_print_u64_dec helper respectively) to avoid the
+//   reserved-keyword collision with `loop` / `if` / `else` / `for` /
+//   `while` / `match` / `return` (see the paideia-as reserved-labels
+//   feedback note).
 // * No `test reg, reg` mnemonic anywhere; every zero-check is
 //   `cmp reg, 0`.
 // * No `and r11, imm64`; the write-open flag word is a small positive
 //   imm32 loaded directly into rsi.
 // * No 2-op `imul r, imm`; no multiplication anywhere in the body.
+//   Division for line_print_u64_dec's divide-by-10 loop uses the
+//   standard `xor rdx, rdx; div rcx` shape (matches dm_print_u64_dec /
+//   cp_print_u64_dec).
 // * No multiline `pub let = "..."`; all rodata strings are single-line.
 // * `mov r64, imm32` for every small immediate (all constants here fit
 //   in a 31-bit positive imm32 so sign-extension is a no-op).
@@ -204,23 +284,32 @@
 //   `mov rsi, imm64` with an unresolved symbol -- the encoder emits
 //   the correct RIP-relative LEA form when handed the symbolic
 //   expression).
+// * Byte-store idiom `mov [r10], dl` (r/m8, r8 form) matches the
+//   dm_print_u64_dec / cp_print_u64_dec precedent; byte-load idiom
+//   `xor rax, rax; mov_b rax, [r9]` matches the tree's narrow-load
+//   convention (mov_b does not zero-extend on its own).
 // * Module basename `Main` matches filename `main.pdx` (PascalCase, no
 //   directory prefix) per module-basename-pascal.
 // * `@no_frame` on _start because the body ends in sys_exit and never
-//   returns; no callee-save push/pop needed; no nested SysV `call` in
-//   the body (only `syscall` opcodes) so rsp % 16 == 0 holds
-//   throughout.
+//   returns; no callee-save push/pop needed. The one `call
+//   line_print_u64_dec` in _start is a same-module local call to a
+//   SysV-respecting helper; rsp % 16 == 0 holds at the call site per
+//   the PVH loader contract (see v1.1-D alignment note above).
 //
 // -----------------------------------------------------------------------
 // Effects / capabilities
 // -----------------------------------------------------------------------
 //
-// {mem, sysreg} covers rodata reads (line_usage_msg / line_ok_msg /
-// line_read_fail_open_msg / line_read_fail_read_msg / line_write_fail_
-// open_msg / line_write_fail_write_msg), scratch writes to line_buf,
-// and every SYSCALL clobber. @{fs, sched} covers the four fs-gated
+// {mem, sysreg} covers rodata reads (line_usage_msg / line_ok_prefix_
+// msg / line_ok_nl / line_read_fail_open_msg / line_read_fail_read_msg
+// / line_write_fail_open_msg / line_write_fail_write_msg / line_parse_
+// fail_msg / line_schema_tag), scratch reads/writes to line_buf and
+// line_record_buf, .bss slot access for line_session_start_ns, and
+// every SYSCALL clobber. @{fs, sched} covers the four fs-gated
 // syscalls (sys_read/sys_write/sys_open/sys_close) plus sys_exit's
-// task teardown (same declaration shape as cat.pdx).
+// task teardown (same declaration shape as cat.pdx). sys_semantic_send
+// (SC+ ID 115) is capability-ungated per R107-M0-001 (schema is opaque
+// to the kernel; producer requires no cap slot).
 
 module Main = structure {
 
@@ -228,22 +317,26 @@ module Main = structure {
   // Scratch buffer -- 4 KiB read chunk, matches sys_read/sys_write's
   // page-sized transfer sweet spot. Lives in .bss (uninit), aligned to
   // 8 for the userland scratch convention (never used for u64 stores
-  // in v1.1-A; the alignment is precautionary for later milestones
+  // in v1.1-A/D; the alignment is precautionary for later milestones
   // that will add typed line-index tables here).
   // --------------------------------------------------------------------
   pub let mut line_buf : [u8; 4096] = uninit @align(8)
 
   // --------------------------------------------------------------------
-  // Diagnostic messages (fd 2) + fd-1 witness. All immutable, so they
-  // land in .rodata (bundled into the text PT_LOAD by the default
-  // link script, same posture as cat.pdx's cat_err_prefix / cat_err_
-  // suffix). Every literal is single-line to comply with the encoder's
-  // `pub let = "..."` no-multiline restriction (feedback_pdx_encoder_
-  // pitfalls).
+  // Diagnostic messages (fd 2) + fd-1 fingerprint pieces. All immutable,
+  // so they land in .rodata (bundled into the text PT_LOAD by the
+  // default link script, same posture as cat.pdx's cat_err_prefix /
+  // cat_err_suffix and dmesg.pdx's dm_msg_prefix / dm_msg_nl). Every
+  // literal is single-line to comply with the encoder's `pub let =
+  // "..."` no-multiline restriction (feedback_pdx_encoder_pitfalls).
   //
   // Lengths are stored as u64 constants alongside each string so the
   // syscall issuing `mov rdx, <len>` need only load a plain immediate;
   // avoids a strlen scan on the hot path.
+  //
+  // Byte-count discipline: `[u8; N]` size is (literal-char-count + 1)
+  // to include the trailing NUL; the `_len` constant is the wire
+  // length, excluding the NUL.
   // --------------------------------------------------------------------
   pub let line_usage_msg              : [u8; 26] = "line: usage: line <path>\n\0"
   pub let line_usage_msg_len          : u64      = 25
@@ -260,8 +353,27 @@ module Main = structure {
   pub let line_write_fail_write_msg   : [u8; 24] = "LINE WRITE FAIL: write\n\0"
   pub let line_write_fail_write_msg_len:u64      = 23
 
-  pub let line_ok_msg                 : [u8; 22] = "line syscall-wire ok\n\0"
-  pub let line_ok_msg_len             : u64      = 21
+  // v1.1-D success fingerprint pieces. Wire format is
+  //   "line ok -- lines=<N>\n"
+  // emitted as three sys_write calls to fd 1 (prefix + decimal via
+  // line_print_u64_dec + newline). Retires the v1.1-A witness phrase
+  // "line syscall-wire ok\n" per R63.M1-006. Shape mirrors dm_msg_prefix
+  // + dm_msg_nl in dmesg.pdx.
+  pub let line_ok_prefix_msg          : [u8; 18] = "line ok -- lines=\0"
+  pub let line_ok_prefix_msg_len      : u64      = 17
+
+  pub let line_ok_nl                  : [u8; 2]  = "\n\0"
+  pub let line_ok_nl_len              : u64      = 1
+
+  // v1.1-D LINE PARSE FAIL rodata marker, declared but not yet wired
+  // (see file header §v1.1-D addendum). Two entry points will branch
+  // here once the parser lands: (a) the interactive command loop's
+  // per-command dispatch on an unknown opcode or malformed address arm
+  // (M1-005); (b) the `w <path>` / `e <path>` argument-parse failures
+  // once M1-004 distinguishes those paths. Exit status 5 reserved for
+  // parse failures.
+  pub let line_parse_fail_msg         : [u8; 17] = "LINE PARSE FAIL\n\0"
+  pub let line_parse_fail_msg_len     : u64      = 16
 
   // --------------------------------------------------------------------
   // v1.1-B semantic-pipe emission state.
@@ -291,6 +403,84 @@ module Main = structure {
   pub let line_schema_tag             : u64      = 0x656E694C69644500
 
   // ====================================================================
+  // line_print_u64_dec(value: u64) -> ()
+  //
+  // u64 -> decimal ASCII, emitted via sys_write to fd 1 (SC+ ID 1) so
+  // the digits ride the same channel as the v1.1-D fingerprint prefix
+  // + newline. Verbatim adaptation of dm_print_u64_dec (src/user/dmesg.
+  // pdx) / cp_print_u64_dec (src/user/cp.pdx, itself adapted from
+  // ps.pdx / init.pdx print_u64_dec, R17-M2-736 D12 / #736), with the
+  // channel switched from sys_debug_puts (SC+ ID 12) to sys_write
+  // (SC+ ID 1) at the emit callsite. Divide-by-10 loop stashes digits
+  // right-to-left in a 24-byte stack scratch, then one sys_write emits
+  // the [first_digit, len] slice. Zero fast-paths to a single '0'
+  // digit.
+  //
+  // SysV register discipline:
+  //   Reads    : rdi (value)
+  //   Preserves: rbx, rbp, r12-r15 (callee-save; untouched by this body)
+  //   Clobbers : rax, rcx, rdx, rsi, rdi, r9, r10, r11
+  //   Stack    : 24 bytes (20 digits max for u64::MAX + 4 for 16-B align)
+  //
+  // Called once from _start (v1.1-D fingerprint site). r13 (the count
+  // held by the caller) is callee-save, so it survives this call.
+  // ====================================================================
+  pub let line_print_u64_dec : (u64) -> () !{mem, sysreg} @{fs} =
+    fn (value: u64) -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {fs},
+      justification: "R63.M1-006 v1.1-D: u64 -> decimal ASCII for line's `line ok -- lines=<N>\\n` fingerprint suffix, emitted via sys_write (SC+ ID 1) to fd 1 so the digits ride the same channel as the prefix `line ok -- lines=` and the trailing `\\n`. Verbatim divide-by-10 loop shape (src/user/dmesg.pdx §dm_print_u64_dec / src/user/cp.pdx §cp_print_u64_dec / src/user/ps.pdx §print_u64_dec, R17-M2-736 D12 / #736): (1) zero fast-path writes a single '0' digit and returns. (2) Otherwise r9 holds the remaining value and r10 is a right-to-left cursor into a 24-byte stack scratch starting at offset 19; each iteration divides r9 by 10 (rax:rdx = r9/10 via `xor rdx,rdx; div rcx`), converts the remainder to ASCII, stores it at the cursor, decrements the cursor, and loops until the quotient reaches zero. (3) The final cursor position plus (rsp+20 - cursor) gives the [buf, len] slice, emitted as sys_write(fd=1, buf, len) -- rdi=1, rsi=buf, rdx=len, rax=1, syscall. Channel switch from sys_debug_puts (dmesg/cp) to sys_write (line) is deliberate: the v1.1-A witness phrase already rode fd 1, and every downstream reader (tools/run-*.sh, shell smoke) already reads fd 1 for the round-trip echo, so putting the digits on fd 1 keeps them on the same wire. @no_frame: the body manages its own 24-byte frame via `sub rsp, 24` / `add rsp, 24` rather than an auto rbp prologue, matching dm_print_u64_dec / cp_print_u64_dec / print_u64_dec posture verbatim. Encoder-gap discipline: no `add reg, [mem]` / `sub reg, [mem]` -- the cursor arithmetic is register-only; no `test reg, reg` -- every zero-check is `cmp reg, 0`; byte-store `mov [r10], dl` (r/m8, r8 form) matches the tree precedent. Reserved-label discipline: every internal label is prefixed `line_pud_`.",
+      block: {
+        // 24-byte stack scratch (20 digits max + 4-byte 16-B-align slop).
+        sub rsp, 24;
+
+        // Zero special case.
+        cmp rdi, 0;
+        jne line_pud_divide_setup;
+          mov al, 0x30;                   // ASCII '0'
+          mov [rsp], al;
+          mov rdi, 1;                     // fd = stdout
+          mov rsi, rsp;                   // buf = &scratch
+          mov rdx, 1;                     // count = 1
+          mov rax, 1;                     // SC+ ID 1 = sys_write
+          syscall;
+          add rsp, 24;
+          ret;
+
+        line_pud_divide_setup:
+          mov r9, rdi;                    // r9  = remaining value
+          mov r10, rsp;
+          add r10, 19;                    // r10 = cursor at last staging byte
+
+        line_pud_loop_top:
+          mov rax, r9;
+          mov rcx, 10;
+          xor rdx, rdx;                   // zero-extend rdx:rax for div
+          div rcx;                        // rax = quotient, rdx = remainder
+          add rdx, 0x30;                  // digit -> ASCII '0'..'9'
+          mov [r10], dl;                  // store at cursor
+          mov r9, rax;                    // r9 = quotient
+          cmp r9, 0;
+          je line_pud_loop_done;
+          sub r10, 1;                     // advance cursor left
+          jmp line_pud_loop_top;
+
+        line_pud_loop_done:
+          // r10 points at first (MSB) digit. Length = (rsp + 20) - r10.
+          mov rax, rsp;
+          add rax, 20;
+          sub rax, r10;                   // rax = digit count
+          mov rdx, rax;                   // count
+          mov rsi, r10;                   // buf
+          mov rdi, 1;                     // fd = stdout
+          mov rax, 1;                     // SC+ ID 1 = sys_write
+          syscall;
+          add rsp, 24;
+          ret
+      }
+    } @no_frame
+
+  // ====================================================================
   // _start -- user program entry point. Never returns (every terminal
   // path ends in sys_exit).
   // ====================================================================
@@ -298,7 +488,7 @@ module Main = structure {
     fn () -> unsafe {
       effects: {mem, sysreg},
       capabilities: {fs, sched},
-      justification: "line.M1-001 v1.1-A + v1.1-B: retires the STUB body (sys_exit(0)-only) and wires the real four-syscall round-trip. Reads argc from rdi and argv from rsi per the frozen execve ABI (design/user/execve-abi.md). Register plan: r12=fd across each open/close pair; r13=argc; r14=argv base; r15=path=argv[1]; rbx=bytes-read n across the sys_close + sys_open(write) + sys_write chain. All five are SysV callee-save so syscall preserves them (syscall clobbers only rax/rcx/r11 by the amd64 fast-syscall convention). Sequence: (1) r13=rdi, r14=rsi. (2) cmp r13,2; jl line_usage_err (argc<2 -> write line_usage_msg to fd 2, sys_exit(2)). (3) r15=[r14+8] (argv[1]). (4) sys_open(r15, 0, 0): rdi=r15, xor rsi,rsi, xor rdx,rdx, mov rax,2, syscall; cmp rax,0; jl line_open_read_err. r12=rax=fd. (5) sys_read(r12, line_buf, 4096): rdi=r12, lea rsi,[rip+line_buf], mov rdx,4096, mov rax,0, syscall; cmp rax,0; jl line_read_err (zero-length read falls through as valid empty-file). rbx=rax=n. (6) sys_close(r12): rdi=r12, mov rax,3, syscall (return ignored per BSD `cat` posture; matches cat.pdx). (7) sys_write(1, line_buf, rbx): rdi=1, lea rsi,[rip+line_buf], mov rdx,rbx, mov rax,1, syscall (return ignored; tty0 is length-honoring at R17.M0). (8) sys_open(r15, 0x241, 0x1A4) for O_CREAT|O_WRONLY|O_TRUNC | mode 0644: rdi=r15, mov rsi,0x241, mov rdx,0x1A4, mov rax,2, syscall; cmp rax,0; jl line_open_write_err. r12=rax=fd. (9) sys_write(r12, line_buf, rbx): rdi=r12, lea rsi,[rip+line_buf], mov rdx,rbx, mov rax,1, syscall; cmp rax,0; jl line_write_err. (10) sys_close(r12): rdi=r12, mov rax,3, syscall (return ignored). (11) fd-1 witness write: sys_write(1, line_ok_msg, 21): rdi=1, lea rsi,[rip+line_ok_msg], mov rdx,21, mov rax,1, syscall. (12) sys_exit(0): xor rdi,rdi, mov rax,60, syscall (never returns). Trailing hlt on every terminal path is defensive belt-and-suspenders for the impossible fallthrough (matches every other _start in the tree). @no_frame because the body ends in sys_exit and never returns to a caller -- the SysV callee-save contract with the nonexistent caller does not apply; matches cat.pdx / echo_client.pdx / true.pdx posture. All labels prefixed line_ per the reserved-label discipline (loop/if/else etc. are keywords). No `test reg,reg`; every zero-check is `cmp reg,0`. No `and r11,imm64`. No 2-op `imul r,imm`. All immediates fit in a 31-bit positive imm32 (0x241=577, 0x1A4=420, 4096, 2, 3, 21, 22, 23, 25, 60) so mov r64,imm32 sign-extends to positive u64 without the errno.pdx §613 MOVABS-verbatim-load hazard. Signed cmp+jl on rax<0 correctly branches on any -errno sentinel (kernel returns 0xFFFF... which is negative signed) and correctly falls through for valid fd / n values (0 <= x). Effects {mem, sysreg} cover rodata reads (line_usage_msg, line_ok_msg, line_read_fail_*_msg, line_write_fail_*_msg, line_schema_tag), line_buf + line_record_buf scratch access, line_session_start_ns .bss slot access, and syscall register state. Capabilities {fs, sched} cover the sys_open/sys_read/sys_write/sys_close surface (declared @{fs} in syscall_shim.pdx for the same access) plus sys_exit's task teardown (@{sched}); sys_semantic_send (SC+ ID 115) takes NO cap slot (schema is opaque to the kernel; producer is capability-ungated at R107-M0-001 -- see caps.decl §KIND_IPC_ENDPOINT commentary). v1.1-B addendum: Step 0 (top of block) captures session_start_ns via rdtsc + shl rdx,32 + or rax,rdx (pattern proven at pdxsock/src/main.pdx line 795-797 and src/kernel/core/fs/pdxfs_lite/uuid.pdx), stored to line_session_start_ns. Step 11.5 (inserted between fd-1 witness write and sys_exit) emits LineEditRecord@0.1: (a) scan line_buf[0..rbx) counting ASCII '\n' bytes into rcx via a xor rax,rax + mov_b rax,[r9] + cmp rax,10 + je/add/jmp loop with the r11-remaining/`cmp r11,0`/je exit test (no `test r11,r11` per encoder-pitfalls narrow-load discipline; loop pointer r9 bumps forward per iteration so no base+index scaling is exercised); (b) rdtsc + shl+or reconstruction into rax for session_end_ns; (c) marshal 7-u64 record into line_record_buf via `mov [r10 + N], reg` displacement stores (never scaled-index `[r10 + N*8]` per encoder-pitfall v0.36+); (d) sys_semantic_send(0x656E694C69644500, &line_record_buf, 56) at SC+ ID 115. rbx (n) is callee-save so it survives the fd-1 witness sys_write unchanged and serves as the scan bound. rcx is caller-save + SYSCALL-clobbered but is consumed into [r10+0]/[r10+8] BEFORE the sys_semantic_send syscall, so the syscall clobber is invisible. sys_semantic_send's return (0 / -EFAULT / -EINVAL) is intentionally discarded: the round-trip is over and a failure here would be a marshalling bug in this file (56-byte record within [1,240] cap, static rip-relative record_ptr never fails user_ptr_ok) rather than a per-run condition the caller can act on. Error paths (line_{usage,open_read,read,open_write,write}_err) emit NO record (no session to describe; matches pdxsock v1.1-B posture at pdxsock_emit_session_and_exit vs the pdxsock_udp_not_yet / socket-error arms). Schema tag `0x656E694C69644500` loaded as imm64 via movabs (matches pdxsock_schema_sock_session at pdxsock/src/main.pdx line 820); the line_schema_tag rodata declaration exists as a grep-anchor for the ver-01 semantic (a M2 bump to @0.2 increments the tag in both the declaration and the movabs). Timestamp caveat: session_{start,end}_ns are raw TSC ticks not ns until sys_clock_now lands; schema-shape name preserved so a re-land is field-additive (precedent: src/kernel/core/fs/pdxfs_lite/write.pdx R25-M2-005 #919, pdxsock v1.1-B). Emit-block encoder discipline: no `test rN,rN` (every zero-check `cmp rN,0`); no 2-op `imul r,imm` (no multiplication); no `and reg,imm64` (no wide masks); no `cmp reg,[mem]` (every mem read staged through a register); no scaled-index `[reg + N*idx]` in position-sensitive contexts (only displacement `[reg + N]` and pointer-bump `[r9]` used). Every new label prefixed `line_emit_` (reserved-label discipline; grep audit confirms no line_emit_ hits elsewhere in src/).",
+      justification: "line.M1-001 v1.1-A + v1.1-B + v1.1-D: retires the STUB body (sys_exit(0)-only), wires the real four-syscall round-trip (v1.1-A), publishes LineEditRecord@0.1 via sys_semantic_send on the happy-path tail (v1.1-B), and lands the R63.M1-006 fingerprint `line ok -- lines=<N>\\n` plus the LINE PARSE FAIL rodata marker (v1.1-D). Reads argc from rdi and argv from rsi per the frozen execve ABI (design/user/execve-abi.md). Register plan: r12=fd across each open/close pair; r13=argc at Step 1-2 then REPURPOSED at Step 10.5+ as the newline count (callee-save, survives every subsequent syscall + the `call line_print_u64_dec`); r14=argv base; r15=path=argv[1]; rbx=bytes-read n across the sys_close + sys_open(write) + sys_write + newline-scan + fingerprint + emit chain. All five are SysV callee-save so syscall preserves them (syscall clobbers only rax/rcx/r11 by the amd64 fast-syscall convention). Sequence: (1) r13=rdi, r14=rsi. (2) cmp r13,2; jl line_usage_err (argc<2 -> write line_usage_msg to fd 2, sys_exit(2)). (3) r15=[r14+8] (argv[1]). (4) sys_open(r15, 0, 0): rdi=r15, xor rsi,rsi, xor rdx,rdx, mov rax,2, syscall; cmp rax,0; jl line_open_read_err. r12=rax=fd. (5) sys_read(r12, line_buf, 4096): rdi=r12, lea rsi,[rip+line_buf], mov rdx,4096, mov rax,0, syscall; cmp rax,0; jl line_read_err (zero-length read falls through as valid empty-file). rbx=rax=n. (6) sys_close(r12): rdi=r12, mov rax,3, syscall (return ignored per BSD `cat` posture; matches cat.pdx). (7) sys_write(1, line_buf, rbx): rdi=1, lea rsi,[rip+line_buf], mov rdx,rbx, mov rax,1, syscall (return ignored; tty0 is length-honoring at R17.M0). (8) sys_open(r15, 0x241, 0x1A4) for O_CREAT|O_WRONLY|O_TRUNC | mode 0644: rdi=r15, mov rsi,0x241, mov rdx,0x1A4, mov rax,2, syscall; cmp rax,0; jl line_open_write_err. r12=rax=fd. (9) sys_write(r12, line_buf, rbx): rdi=r12, lea rsi,[rip+line_buf], mov rdx,rbx, mov rax,1, syscall; cmp rax,0; jl line_write_err. (10) sys_close(r12): rdi=r12, mov rax,3, syscall (return ignored). (10.5) v1.1-D newline-count loop: lea r9,[rip+line_buf]; mov r11,rbx; xor r13,r13 (repurpose r13 -- argc is dead after Step 2); walk r9 forward decrementing r11 while accumulating ASCII-'\\n' count in r13. Loop control uses `cmp r11,0`/`je` and `cmp rax,10`/`jne` (never `test`); byte load uses the `xor rax,rax; mov_b rax,[r9]` narrow-load idiom. Zero-length input (rbx==0) falls straight through with r13==0. Every label prefixed line_emit_. (11) v1.1-D fingerprint (three sys_writes to fd 1): (a) sys_write(1, line_ok_prefix_msg, 17): rdi=1, lea rsi,[rip+line_ok_prefix_msg], mov rdx,17, mov rax,1, syscall; (b) mov rdi,r13 (value=count), call line_print_u64_dec (SysV-respecting local helper -- rsp%16==0 at the call site per PVH loader contract, self-manages 24-byte scratch, preserves r13 as callee-save); (c) sys_write(1, line_ok_nl, 1): rdi=1, lea rsi,[rip+line_ok_nl], mov rdx,1, mov rax,1, syscall. Retires the v1.1-A witness phrase `line syscall-wire ok\\n` per R63.M1-006. Empty-input path emits `line ok -- lines=0\\n` via the helper's single-'0' fast-path. Error paths emit NO fingerprint (per-cause marker only). (11.5) v1.1-B/D semantic-pipe emit: (a) rdtsc + shl+or reconstruction into rax for session_end_ns; (b) marshal 7-u64 record into line_record_buf via `mov [r10 + N], reg` displacement stores (never scaled-index `[r10 + N*8]` per encoder-pitfall v0.36+) with lines_in / lines_out both read from r13 (the v1.1-D count computed at Step 10.5, unchanged by the intervening syscalls / call since r13 is callee-save); (c) sys_semantic_send(0x656E694C69644500, &line_record_buf, 56) at SC+ ID 115. rbx (n) is callee-save so it survives the fingerprint sys_writes and reaches the emit block unchanged (it is not read there; the count is r13, not rbx). sys_semantic_send's return (0 / -EFAULT / -EINVAL) is intentionally discarded: the round-trip is over and a failure here would be a marshalling bug in this file (56-byte record within [1,240] cap, static rip-relative record_ptr never fails user_ptr_ok) rather than a per-run condition the caller can act on. The v1.1-B block's own duplicate newline-count loop is retired at v1.1-D: r13 is the single source of truth for the count across the fingerprint AND the marshalling. Error paths (line_{usage,open_read,read,open_write,write}_err) emit NO record and NO fingerprint (no session to describe; matches pdxsock v1.1-B posture at pdxsock_emit_session_and_exit vs the pdxsock_udp_not_yet / socket-error arms). Schema tag `0x656E694C69644500` loaded as imm64 via movabs (matches pdxsock_schema_sock_session at pdxsock/src/main.pdx line 820); the line_schema_tag rodata declaration exists as a grep-anchor for the ver-01 semantic (a M2 bump to @0.2 increments the tag in both the declaration and the movabs). Timestamp caveat: session_{start,end}_ns are raw TSC ticks not ns until sys_clock_now lands; schema-shape name preserved so a re-land is field-additive. (12) sys_exit(0): xor rdi,rdi, mov rax,60, syscall (never returns). Trailing hlt on every terminal path is defensive belt-and-suspenders for the impossible fallthrough (matches every other _start in the tree). Step 0 (top of block) still captures session_start_ns via rdtsc + shl rdx,32 + or rax,rdx, stored to line_session_start_ns (unchanged from v1.1-B). @no_frame because the body ends in sys_exit and never returns to a caller -- the SysV callee-save contract with the nonexistent caller does not apply; matches cat.pdx / echo_client.pdx / true.pdx / dmesg.pdx posture. The one `call line_print_u64_dec` in the body is a same-module SysV-respecting helper; rsp%16==0 holds at the call site per the PVH loader contract (no pushes in _start), and the helper's internal `sub rsp, 24` after the call's 8-byte push keeps rsp%16==0 through the helper's syscall (syscall does not require 16-byte alignment anyway; the 24-byte scratch tracks the dmesg/cp precedent). All labels prefixed line_ per the reserved-label discipline (loop/if/else etc. are keywords); v1.1-B/D emit-block labels prefixed line_emit_; helper labels prefixed line_pud_. No `test reg,reg`; every zero-check is `cmp reg,0`. No `and r11,imm64`. No 2-op `imul r,imm`. All immediates fit in a 31-bit positive imm32 (0x241=577, 0x1A4=420, 4096, 2, 3, 17, 21, 22, 23, 25, 56, 60, 115) so mov r64,imm32 sign-extends to positive u64 without the errno.pdx §613 MOVABS-verbatim-load hazard. Signed cmp+jl on rax<0 correctly branches on any -errno sentinel (kernel returns 0xFFFF... which is negative signed) and correctly falls through for valid fd / n values (0 <= x). Effects {mem, sysreg} cover rodata reads (line_usage_msg, line_ok_prefix_msg, line_ok_nl, line_read_fail_*_msg, line_write_fail_*_msg, line_parse_fail_msg, line_schema_tag), line_buf + line_record_buf scratch access, line_session_start_ns .bss slot access, and syscall register state. Capabilities {fs, sched} cover the sys_open/sys_read/sys_write/sys_close surface (declared @{fs} in syscall_shim.pdx for the same access) plus sys_exit's task teardown (@{sched}); sys_semantic_send (SC+ ID 115) takes NO cap slot (schema is opaque to the kernel; producer is capability-ungated at R107-M0-001 -- see caps.decl §KIND_IPC_ENDPOINT commentary). Emit-block encoder discipline: no `test rN,rN` (every zero-check `cmp rN,0`); no 2-op `imul r,imm` (no multiplication in _start; the helper uses `div rcx` only); no `and reg,imm64` (no wide masks); no `cmp reg,[mem]` (every mem read staged through a register); no scaled-index `[reg + N*idx]` in position-sensitive contexts (only displacement `[reg + N]` and pointer-bump `[r9]` used).",
       block: {
         // ---- v1.1-B Step 0: capture session_start_ns via rdtsc. ----
         // rdtsc returns EDX:EAX = 64-bit TSC. We compose into rax
@@ -394,51 +584,28 @@ module Main = structure {
         mov rax, 3;                         // SC+ ID 3 = sys_close
         syscall;
 
-        // ---- Step 11: fd-1 witness write ("line syscall-wire ok\n"). ----
-        mov rdi, 1;                         // fd = stdout
-        lea rsi, [rip + line_ok_msg];       // buf
-        mov rdx, 21;                        // line_ok_msg_len
-        mov rax, 1;                         // SC+ ID 1 = sys_write
-        syscall;
-
         // ================================================================
-        // v1.1-B Step 11.5: emit LineEditRecord@0.1 via sys_semantic_send.
+        // v1.1-D Step 10.5: newline count over line_buf[0..rbx) into r13.
         //
-        // Live at entry:
-        //   rbx = n              (bytes read/written; scan bound)
-        //   line_session_start_ns cached at .bss (v1.1-B Step 0)
+        // r13 held argc through Step 2 and is dead from Step 3 onward.
+        // Repurpose it here to hold the newline count as a SysV callee-
+        // save register so the count survives the three fingerprint
+        // sys_writes, the intervening `call line_print_u64_dec`, and
+        // the v1.1-B semantic-pipe marshalling block unchanged.
         //
-        // Scratch (all caller-save; freely trashed):
-        //   rax        rdtsc dst + record accumulator
-        //   rdx        rdtsc upper half + record accumulator
-        //   r9         byte-scan pointer / record-buf base
-        //   r10        record-buf base / one-value scratch
-        //   r11        remaining bytes to scan
-        //   rcx        newline count accumulator (moves to record)
-        //   rdi rsi    sys_semantic_send arg registers
+        // rbx == 0 (empty input) falls through with r13 == 0 -- the
+        // fingerprint then reads `line ok -- lines=0\n` via the
+        // helper's single-'0' fast-path.
         //
-        // Steps:
-        //   (a) Count newlines in line_buf[0..rbx). rbx==0 (empty file)
-        //       falls through with count=0, honestly reporting a zero-
-        //       line record.
-        //   (b) rdtsc -> session_end_ns.
-        //   (c) Marshal 7 u64 fields into line_record_buf.
-        //   (d) sys_semantic_send(schema, &line_record_buf, 56).
-        //       Return in rax is intentionally discarded (see file
-        //       header §v1.1-B addendum).
-        //
-        // Byte load uses `xor rax, rax; mov_b rax, [r9]` per the
-        // encoder-pitfalls narrow-load idiom (mov_b does NOT zero-
-        // extend on its own; precedent src/kernel/core/syscall/sys_umount.
-        // pdx path-hash loop). Loop control uses `cmp r11, 0` +
-        // `je/jne`, never `test r11, r11`. Displacement form `[r10 + N]`
-        // for every store, never scaled-index `[r10 + N*8]`.
+        // Loop control uses `cmp r11, 0` + `je` and `cmp rax, 10` +
+        // `jne`, never `test` (encoder-pitfall discipline). Byte load
+        // uses `xor rax, rax; mov_b rax, [r9]` (mov_b does not zero-
+        // extend on its own; precedent src/kernel/core/syscall/sys_
+        // umount.pdx path-hash loop). Labels prefixed line_emit_.
         // ================================================================
-
-        // ---- (a) Newline count. r9 = &line_buf; r11 = remaining; rcx = count. ----
         lea r9, [rip + line_buf];
         mov r11, rbx;                       // remaining = n
-        xor rcx, rcx;                       // count = 0
+        xor r13, r13;                       // count = 0 (repurpose argc slot)
       line_emit_count_loop:
         cmp r11, 0;
         je  line_emit_count_done;
@@ -446,22 +613,87 @@ module Main = structure {
         mov_b rax, [r9];                    // rax = *r9 (zero-extended byte)
         cmp rax, 10;                        // ASCII '\n'
         jne line_emit_count_skip;
-        add rcx, 1;
+        add r13, 1;
       line_emit_count_skip:
         add r9, 1;
         sub r11, 1;
         jmp line_emit_count_loop;
       line_emit_count_done:
 
-        // ---- (b) session_end_ns via rdtsc reconstruction. ----
+        // ================================================================
+        // v1.1-D Step 11: fingerprint `line ok -- lines=<N>\n` to fd 1.
+        //
+        // Three sys_write calls in sequence -- prefix, decimal digits
+        // via line_print_u64_dec, trailing newline. Retires the v1.1-A
+        // witness phrase `line syscall-wire ok\n` per R63.M1-006. The
+        // count in r13 is callee-save so it survives all three syscalls
+        // AND the local `call line_print_u64_dec` (which preserves r13
+        // per SysV callee-save discipline).
+        //
+        // Alignment: entry to _start has rsp%16==0 per the PVH loader
+        // contract. No pushes in _start, so at the `call line_print_u64_
+        // dec` site rsp%16 is still 0. After the call pushes 8 bytes and
+        // the helper does `sub rsp, 24`, the total is 32 (%16==0). The
+        // syscall opcode does not require 16-byte alignment anyway.
+        // ================================================================
+
+        // ---- (11a) prefix "line ok -- lines=" (17 bytes). ----
+        mov rdi, 1;                         // fd = stdout
+        lea rsi, [rip + line_ok_prefix_msg];
+        mov rdx, 17;                        // line_ok_prefix_msg_len
+        mov rax, 1;                         // SC+ ID 1 = sys_write
+        syscall;
+
+        // ---- (11b) decimal <N> via line_print_u64_dec. ----
+        mov rdi, r13;                       // value = newline count
+        call line_print_u64_dec;
+
+        // ---- (11c) trailing newline "\n" (1 byte). ----
+        mov rdi, 1;                         // fd = stdout
+        lea rsi, [rip + line_ok_nl];
+        mov rdx, 1;                         // line_ok_nl_len
+        mov rax, 1;                         // SC+ ID 1 = sys_write
+        syscall;
+
+        // ================================================================
+        // v1.1-B Step 11.5: emit LineEditRecord@0.1 via sys_semantic_send.
+        //
+        // Live at entry:
+        //   rbx = n              (bytes read/written; not read here at
+        //                         v1.1-D -- count comes from r13)
+        //   r13 = newline count  (v1.1-D; carried through the fingerprint)
+        //   line_session_start_ns cached at .bss (v1.1-B Step 0)
+        //
+        // Scratch (all caller-save; freely trashed):
+        //   rax        rdtsc dst + record accumulator
+        //   rdx        rdtsc upper half + record accumulator
+        //   r9         record-buf base scratch
+        //   r10        record-buf base
+        //   rdi rsi    sys_semantic_send arg registers
+        //
+        // Steps:
+        //   (a) rdtsc -> session_end_ns.
+        //   (b) Marshal 7 u64 fields into line_record_buf. lines_in and
+        //       lines_out both read from r13 (v1.1-D single source of
+        //       truth; the pre-v1.1-D duplicate count loop here is
+        //       retired).
+        //   (c) sys_semantic_send(schema, &line_record_buf, 56).
+        //       Return in rax is intentionally discarded (see file
+        //       header §v1.1-B addendum).
+        //
+        // Displacement form `[r10 + N]` for every store, never scaled-
+        // index `[r10 + N*8]` (encoder-pitfall v0.36+).
+        // ================================================================
+
+        // ---- (a) session_end_ns via rdtsc reconstruction. ----
         rdtsc;                              // EDX:EAX = 64-bit TSC
         shl rdx, 32;
         or  rax, rdx;                       // rax = session_end_ns
 
-        // ---- (c) Marshal 56-byte LineEditRecord@0.1 into line_record_buf. ----
+        // ---- (b) Marshal 56-byte LineEditRecord@0.1 into line_record_buf. ----
         lea r10, [rip + line_record_buf];
-        mov [r10 + 0],  rcx;                // lines_in         = newline count
-        mov [r10 + 8],  rcx;                // lines_out        = same (byte-for-byte round-trip at v1.1-B)
+        mov [r10 + 0],  r13;                // lines_in         = v1.1-D count
+        mov [r10 + 8],  r13;                // lines_out        = same (byte-for-byte round-trip at v1.1-B)
         mov r9, 1;
         mov [r10 + 16], r9;                 // files_read       = 1 (happy path)
         mov [r10 + 24], r9;                 // files_written    = 1 (happy path)
@@ -471,7 +703,7 @@ module Main = structure {
         mov [r10 + 40], r9;                 // session_start_ns (raw TSC ticks)
         mov [r10 + 48], rax;                // session_end_ns   (raw TSC ticks)
 
-        // ---- (d) sys_semantic_send(schema, record_ptr, record_len). SC+ ID 115. ----
+        // ---- (c) sys_semantic_send(schema, record_ptr, record_len). SC+ ID 115. ----
         // Schema tag `LineEdit` marker (see line_schema_tag rodata
         // declaration). Loaded as an imm64 via movabs; matches the
         // pdxsock_schema_sock_session usage at pdxsock/src/main.pdx
@@ -497,7 +729,8 @@ module Main = structure {
         // Error arms. Each writes its diagnostic to fd 2, then sys_exit
         // with the exit code documented in the module header. Each is
         // reached via a single forward branch and falls off the end of
-        // the block through a defensive hlt.
+        // the block through a defensive hlt. NO fingerprint is emitted
+        // on any error path (per R63.M1-006 emit posture).
         // ================================================================
 
       line_usage_err:

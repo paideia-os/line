@@ -53,10 +53,12 @@ requires:
 # `LineEdit` mnemonic) via `sys_semantic_send` (SC+ ID 115) on the
 # successful round-trip tail, carrying `{lines_in, lines_out,
 # files_read, files_written, edit_count, session_start_ns,
-# session_end_ns}`. Fd 1 still carries the raw echoed buffer bytes plus
-# the plain-ASCII `line syscall-wire ok\n` witness (unchanged from
-# v1.1-A -- the fingerprint and the semantic record are independent
-# channels).
+# session_end_ns}`. Fd 1 carries the raw echoed buffer bytes plus the
+# v1.1-D plain-ASCII fingerprint `line ok -- lines=<N>\n` (three
+# sys_writes: prefix + line_print_u64_dec decimal + newline) -- the
+# fingerprint and the semantic record are independent channels. The
+# v1.1-A witness phrase `line syscall-wire ok\n` is retired by v1.1-D
+# per R63.M1-006.
 #
 # Timestamps are raw rdtsc TSC ticks at v1.1-B (no user-facing
 # `sys_clock_now` yet); schema-shape name preserved so a re-land is
