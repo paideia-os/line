@@ -37,6 +37,12 @@ caps_decl   = caps.decl
 sources:
   - src/main.pdx                  # M1-001 (v1.1-A/B): _start + real syscall wire
                                   #   + LineEditRecord@0.1 emission (v1.1-B)
+  - src/buffer.pdx                # M1-003 (v1.2-A): line-array buffer state
+                                  #   + 1-based cursor + edit ops (insert /
+                                  #   delete / replace / get_ptr / get_len /
+                                  #   last_addr / cursor_get / cursor_set)
+                                  #   backing the M1-002 grammar. Called from
+                                  #   Main::_start at M1-005 dispatch.
 
 # --- Library dependencies ---------------------------------------------
 # v1.1-A pulls in zero libraries -- the four syscalls (read/write/open/

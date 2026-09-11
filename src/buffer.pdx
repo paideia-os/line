@@ -1,0 +1,708 @@
+// src/buffer.pdx -- line.M1-003 v1.2-A --
+// R63.M1-003 (paideia-os/line#3): line-array buffer state + 1-based
+// cursor + edit operations, backing the M1-002 (line#2, already closed)
+// ed-style command grammar `a i d c p w q Q . , $` and the M1-005
+// interactive `:` prompt that will wire the buffer into the round-trip.
+//
+// -----------------------------------------------------------------------
+// Scope at this landing (v1.2-A)
+// -----------------------------------------------------------------------
+//
+// This file is the in-memory line-array store for the editor. It is a
+// bare-metal, fixed-pool structure (no dynamic allocation -- paideia-os
+// user tools have no malloc / free at R63) with:
+//
+//   * A fixed pool of BUFFER_MAX_LINES = 512 line records.
+//   * Each record is BUFFER_MAX_LINE_LEN = 256 bytes of text (u8[256])
+//     plus a paired 8-byte length (bytes actually valid in the slot).
+//   * A single u64 cursor (`buffer_cursor`, 1-based; 0 == "before line 1"
+//     == empty buffer sentinel).
+//   * A single u64 line count (`buffer_count`, number of valid slots).
+//
+// Six public entry points are exported. Every one uses SysV amd64 calling
+// convention and preserves rbx / rbp / r12-r15 (all scratch stays inside
+// the caller-save set: rax / rcx / rdx / rsi / rdi / r8 / r9 / r10 / r11).
+// None issue any syscall -- these are pure memory ops -- so effects are
+// !{mem} only, and no capability slot is declared.
+//
+//   buffer_insert_line(after, text_ptr, text_len)  -> new-line 1-based
+//                                                     addr, or err sentinel
+//   buffer_delete_line(addr)                       -> new count,
+//                                                     or err sentinel
+//   buffer_replace_line(addr, text_ptr, text_len)  -> addr,
+//                                                     or err sentinel
+//   buffer_get_line_ptr(addr)                      -> &pool[slot],
+//                                                     or err sentinel
+//   buffer_get_line_len(addr)                      -> len[slot],
+//                                                     or err sentinel
+//   buffer_last_addr()                             -> line count (for `$`)
+//   buffer_cursor_get()                            -> cursor (for `.`)
+//   buffer_cursor_set(addr)                        -> cursor after set,
+//                                                     or err sentinel
+//
+// The (ptr, len) pair for `get_line` is split into two separate accessors
+// because paideia-as at 0.36+ does not yet elaborate tuple returns; the
+// caller invokes both when it needs both. Cost is negligible for the
+// editor's `p` command (one-shot per address).
+//
+// -----------------------------------------------------------------------
+// Cursor semantics (per ed convention, minimal at this landing)
+// -----------------------------------------------------------------------
+//
+// The cursor (`.` in ed grammar) persists across ops. It is not reset per
+// command. The three edit ops adjust it as follows:
+//
+//   * insert  -> cursor = 1-based addr of the newly inserted line
+//                (i.e. `after + 1`); this is where `.` lands after `a`
+//                or `i` per POSIX ed §"Addressing".
+//   * delete  -> cursor = min(addr, new_count); if the deleted line was
+//                the last, cursor drops to new_count (may become 0 for
+//                a buffer that was 1-line before the delete).
+//   * replace -> cursor = addr (the replaced line remains addressable
+//                and is where `.` should now be).
+//
+// `get_line_*` and `last_addr` and `cursor_get` do NOT move the cursor.
+// `cursor_set` writes the cursor with bounds validation (0 <= addr <=
+// count is accepted; 0 is the pre-line-1 sentinel and is valid).
+//
+// -----------------------------------------------------------------------
+// Error sentinels (line/ own return-value failure band)
+// -----------------------------------------------------------------------
+//
+// Runtime error returns use the top-bit-set band `0xFFFFFFFFFFFFFF0N`
+// (all upper 56 bits set, low byte identifies the cause). This band is
+// disjoint from any valid u64 return in this file:
+//
+//   * `insert` returns the new addr, at most BUFFER_MAX_LINES (512).
+//   * `delete` returns the new count, at most 512.
+//   * `replace` returns the addr, at most 512.
+//   * `get_line_ptr` returns a rip-relative address to `buffer_pool`,
+//     which lives in .bss and is far below 0xFFFF... on every paideia-os
+//     user-mode address map (user .bss sits near 0x0000...).
+//   * `get_line_len` returns a length, at most BUFFER_MAX_LINE_LEN (256).
+//   * `last_addr` / `cursor_get` return counts, at most 512.
+//   * `cursor_set` returns the new cursor, at most 512.
+//
+// The three sentinel values (in the top of the failure band):
+//
+//   BUFFER_ERR_OOB            = 0xFFFFFFFFFFFFFF01  -- addr out of range
+//                                                    (addr == 0 for
+//                                                    `delete`/`replace`/
+//                                                    `get`, or addr >
+//                                                    count for any op;
+//                                                    also for `insert`
+//                                                    when `after` > count)
+//   BUFFER_ERR_POOL_FULL      = 0xFFFFFFFFFFFFFF02  -- `insert` when the
+//                                                    pool is at capacity
+//   BUFFER_ERR_LINE_TOO_LONG  = 0xFFFFFFFFFFFFFF03  -- `insert` or
+//                                                    `replace` with a
+//                                                    text_len > 256
+//
+// The band is distinct from the process-exit codes {0=OK, 2=usage,
+// 3=READ FAIL, 4=WRITE FAIL, 5=PARSE FAIL} declared at main.pdx (exit
+// codes are per-process teardown; sentinels are per-call return values).
+// M1-005 will map the sentinel band to exit 5 (LINE PARSE FAIL) at the
+// dispatch layer, or to per-command diagnostic messages, without any
+// change to this file. Sentinels loaded via `mov r64, imm64` (movabs),
+// matching the pdxsock schema-tag / line_schema_tag precedent -- the
+// small-imm32 mov-sign-extend path is not usable here because the top
+// bit is set.
+//
+// -----------------------------------------------------------------------
+// Storage layout
+// -----------------------------------------------------------------------
+//
+// Three .bss slots, all @align(8):
+//
+//   buffer_pool   : [u8; 131072]  -- 512 slots * 256 bytes text each.
+//                                   Slot k occupies buffer_pool[k*256 ..
+//                                   k*256 + 256). Only bytes [0, len[k])
+//                                   in each slot are meaningful; the tail
+//                                   may contain stale bytes from a
+//                                   previous occupant after a shift. The
+//                                   length array is authoritative for
+//                                   read-back.
+//   buffer_len    : [u8; 4096]    -- 512 * 8 bytes; each 8-byte block is
+//                                   a naturally-aligned u64 length for
+//                                   the paired slot. Declared as [u8; N]
+//                                   for the same reason as
+//                                   `line_session_start_ns` in main.pdx
+//                                   (the encoder is happier with [u8; N]
+//                                   than with `[u64; N]` for @align(8)
+//                                   .bss slabs at 0.36+); reads/writes
+//                                   are 8-byte MOV pairs at computed
+//                                   offsets, which stay aligned because
+//                                   the base is aligned and offsets are
+//                                   multiples of 8.
+//   buffer_count  : u64           -- number of valid lines, [0, 512].
+//   buffer_cursor : u64           -- 1-based cursor, [0, buffer_count].
+//                                   0 is the sentinel "before line 1"
+//                                   / "empty buffer" state used at boot
+//                                   (buffer_count == 0).
+//
+// The pool is intentionally uninitialised at load time. Correctness is
+// maintained by the invariant that only buffer_count slots are ever
+// read, and any read passes through a bounds check first. No zero-fill
+// pass is required at _start.
+//
+// -----------------------------------------------------------------------
+// Encoder guardrails (paideia-as v0.36+; matches main.pdx §Encoder)
+// -----------------------------------------------------------------------
+//
+// * Reserved-label prefix: every internal label is `buffer_` prefixed
+//   to avoid the `loop` / `if` / `else` / `for` / `while` / `match` /
+//   `return` reserved-keyword collision.
+// * No `test reg, reg` anywhere. Every zero-check is `cmp reg, 0`.
+// * No `and reg, imm64`. No wide-immediate masks are needed here.
+// * No 2-op `imul r, imm`. Slot offsets use `shl reg, 8` (times 256)
+//   and `shl reg, 3` (times 8); length words are u64 pairs.
+// * No scaled-index `[reg + N*idx]` in address computation; every base+
+//   offset uses `lea rN, [rip + sym]; add rN, offset` (displacement
+//   composition), or a plain register through a computed pointer.
+// * Byte-store idiom `mov [rN], al` (r/m8, r8 form); byte-load idiom
+//   `xor rax, rax; mov_b rax, [rN]` (mov_b does not zero-extend on its
+//   own -- narrow-load precedent per main.pdx §Step 10.5).
+// * `mov r64, imm32` for every immediate <= 0x7FFFFFFF (fits SysV imm32
+//   sign-extend); `mov r64, imm64` (movabs) only for the three error
+//   sentinels (top bit set, cannot use the imm32 form). All in-band
+//   constants (0, 1, 8, 256, 512) fit imm32 trivially.
+// * `lea rN, [rip + sym]` for every rodata / .bss address load.
+// * @no_frame on every helper: the body ends in `ret`, manages no
+//   auto rbp prologue, and touches no callee-save register (so the
+//   SysV callee-save contract is trivially preserved without any
+//   push / pop -- same posture as line_print_u64_dec in main.pdx which
+//   also uses @no_frame plus self-managed scratch).
+// * Module basename `Buffer` matches filename `buffer.pdx` (PascalCase,
+//   no directory prefix) per module-basename-pascal.
+// * Unsigned comparisons (ja / jae / jb / jbe) for every bounds check
+//   because inputs are u64 in [0, 512]; signed jl / jg would work
+//   equivalently in this range but ja / jbe reads more directly.
+//
+// -----------------------------------------------------------------------
+// Effects / capabilities
+// -----------------------------------------------------------------------
+//
+// !{mem} covers rip-relative reads/writes of buffer_pool / buffer_len /
+// buffer_count / buffer_cursor and the caller-supplied text_ptr reads
+// on the copy hot path. No syscall is issued anywhere in this file, so
+// no `sysreg` clobber effect and no capability slot are declared. The
+// dispatch layer at M1-005 will call these entries from within Main's
+// {mem, sysreg} @{fs, sched} region; effects compose additively so the
+// caller's declaration remains sufficient.
+
+module Buffer = structure {
+
+  // --------------------------------------------------------------------
+  // Pool sizing constants -- documentation anchors. The code below uses
+  // the numeric literals 512 and 256 directly (both fit imm32 by a wide
+  // margin), so these declarations are for greppability from the
+  // dispatch layer at M1-005 and from the STATUS.md / CHANGELOG entries.
+  // Any bump changes both the constant here AND the numeric literal in
+  // every code arm (search-and-replace safe: `\b512\b` and `\b256\b`
+  // only appear as the pool bounds in this file).
+  // --------------------------------------------------------------------
+  pub let buffer_max_lines           : u64 = 512
+  pub let buffer_max_line_len        : u64 = 256
+
+  // --------------------------------------------------------------------
+  // Error sentinels (line/ own return-value failure band).
+  // Top 56 bits all 1; low byte identifies. All three fit only in an
+  // imm64, so callsites use `mov r64, imm64` (movabs) to load them.
+  // See file header §"Error sentinels" for the disjoint-band argument.
+  // --------------------------------------------------------------------
+  pub let buffer_err_oob             : u64 = 0xFFFFFFFFFFFFFF01
+  pub let buffer_err_pool_full       : u64 = 0xFFFFFFFFFFFFFF02
+  pub let buffer_err_line_too_long   : u64 = 0xFFFFFFFFFFFFFF03
+
+  // --------------------------------------------------------------------
+  // Storage pools. @align(8) on every uninit slab so every u64 store
+  // (length, count, cursor) lands on a naturally-aligned address; each
+  // 256-byte slot boundary is also 8-aligned by construction.
+  //
+  // buffer_pool: 512 * 256 = 131072 bytes. Big enough that the loader's
+  // .bss reservation grows by ~128 KiB, well within the user-program
+  // budget (main.pdx already reserves 4 KiB + 56 B + 8 B; totals sit at
+  // ~132 KiB, an order of magnitude below the pdxsock v1.1-B footprint).
+  //
+  // buffer_len: 512 * 8 = 4096 bytes; treated as 512 u64 slots via
+  // (index * 8) offsets. [u8; N] shape matches main.pdx's
+  // line_session_start_ns declaration convention for @align(8) .bss.
+  //
+  // buffer_count / buffer_cursor start at 0 (pre-line-1 sentinel).
+  // These are the only initialised slots; the pools are `uninit` because
+  // slot content is only read after being written by an edit op that
+  // also updates buffer_count.
+  // --------------------------------------------------------------------
+  pub let mut buffer_pool            : [u8; 131072] = uninit @align(8)
+  pub let mut buffer_len             : [u8; 4096]   = uninit @align(8)
+  pub let mut buffer_count           : u64          = 0
+  pub let mut buffer_cursor          : u64          = 0
+
+  // ====================================================================
+  // buffer_last_addr() -> u64
+  //
+  // Returns the number of valid lines (backs the `$` grammar target).
+  // For an empty buffer, returns 0 (the same as `.` at boot; ed
+  // convention: `$` on an empty buffer refers to line 0, i.e. the
+  // pre-line-1 sentinel).
+  // ====================================================================
+  pub let buffer_last_addr : () -> u64 !{mem} =
+    fn () -> unsafe {
+      effects: {mem},
+      justification: "R63.M1-003 v1.2-A: return buffer_count as-is. `$` in the M1-002 ed grammar addresses the last line; when the buffer is empty, the caller sees 0 and must map that to the ed `?` error or accept 0 as the pre-line-1 sentinel per the dispatch policy landed at M1-005. Reads one u64 from .bss (rip-relative load); no other memory access; no bounds risk. @no_frame because the body is one load + ret; no scratch beyond rax; no callee-save touched.",
+      block: {
+        mov rax, [rip + buffer_count];
+        ret
+      }
+    } @no_frame
+
+  // ====================================================================
+  // buffer_cursor_get() -> u64
+  //
+  // Returns the 1-based cursor position (backs the `.` grammar target).
+  // 0 is the "before line 1" sentinel (empty buffer, or a `cursor_set`
+  // call with addr == 0).
+  // ====================================================================
+  pub let buffer_cursor_get : () -> u64 !{mem} =
+    fn () -> unsafe {
+      effects: {mem},
+      justification: "R63.M1-003 v1.2-A: return buffer_cursor as-is. `.` in the M1-002 ed grammar addresses the current line; the caller (dispatch at M1-005) is responsible for translating a 0 return to the ed `?` diagnostic when 0 is not a valid target for the requesting command (e.g. `p` on line 0). Symmetric with buffer_last_addr: one rip-relative load + ret. @no_frame; no scratch beyond rax.",
+      block: {
+        mov rax, [rip + buffer_cursor];
+        ret
+      }
+    } @no_frame
+
+  // ====================================================================
+  // buffer_cursor_set(addr: u64) -> u64
+  //
+  // Sets the cursor. Accepts 0 <= addr <= buffer_count (0 is the pre-
+  // line-1 sentinel and is a legal target). Returns the new cursor on
+  // success, or BUFFER_ERR_OOB when addr > buffer_count.
+  //
+  // Register plan:
+  //   rdi = addr        (input; consumed on the OK path via mov to slot)
+  //   rax = count       (loaded for bounds check; overwritten on return)
+  //   All scratch inside the caller-save set. No callee-save touched.
+  // ====================================================================
+  pub let buffer_cursor_set : (u64) -> u64 !{mem} =
+    fn (addr: u64) -> unsafe {
+      effects: {mem},
+      justification: "R63.M1-003 v1.2-A: cursor is a plain u64 slot; validation is `addr <= buffer_count` (unsigned, `ja` branches OOB). No signed-vs-unsigned hazard because both operands are u64 in [0, 512]. OK path stores rdi into the slot and returns rdi; OOB path movabs's BUFFER_ERR_OOB (0xFFFFFFFFFFFFFF01) into rax. @no_frame + reserved-label prefix + no `test` + no `and reg, imm64`.",
+      block: {
+        mov rax, [rip + buffer_count];
+        cmp rdi, rax;
+        ja  buffer_cursor_set_oob;
+        mov [rip + buffer_cursor], rdi;
+        mov rax, rdi;
+        ret;
+
+      buffer_cursor_set_oob:
+        mov rax, 0xFFFFFFFFFFFFFF01;
+        ret
+      }
+    } @no_frame
+
+  // ====================================================================
+  // buffer_get_line_ptr(addr: u64) -> u64
+  //
+  // Returns a rip-relative pointer to slot (addr-1)'s text buffer
+  // (256 bytes). On OOB (addr == 0 or addr > buffer_count) returns
+  // BUFFER_ERR_OOB. Cursor is NOT modified.
+  //
+  // The returned pointer is read-only from the caller's perspective:
+  // the buffer contents are stable until the next `insert`, `delete`,
+  // `or `replace` call at any address <= addr (a shift may relocate
+  // slot content). The caller must copy out before any further edit.
+  //
+  // Register plan:
+  //   rdi = addr             (validated; then decremented to slot idx)
+  //   rax = &pool[slot*256]  (return value)
+  //   r8, r9 = scratch for address composition
+  //   No callee-save touched.
+  // ====================================================================
+  pub let buffer_get_line_ptr : (u64) -> u64 !{mem} =
+    fn (addr: u64) -> unsafe {
+      effects: {mem},
+      justification: "R63.M1-003 v1.2-A: (addr-1) * 256 is a `shl reg, 8` on a u64 that has just been range-checked to [1, 512], so the shift cannot overflow (max value 511 << 8 = 130816, well within u64). Address composition uses `lea rN, [rip + buffer_pool]; add rN, offset` (displacement chain) rather than `[reg + N*idx]` per the encoder-pitfall v0.36+ scaled-index avoidance. OOB uses BUFFER_ERR_OOB via movabs.",
+      block: {
+        cmp rdi, 0;
+        je  buffer_get_ptr_oob;
+        mov rax, [rip + buffer_count];
+        cmp rdi, rax;
+        ja  buffer_get_ptr_oob;
+
+        // slot_index = addr - 1; byte offset = slot_index * 256.
+        mov r8, rdi;
+        sub r8, 1;
+        shl r8, 8;
+        lea rax, [rip + buffer_pool];
+        add rax, r8;
+        ret;
+
+      buffer_get_ptr_oob:
+        mov rax, 0xFFFFFFFFFFFFFF01;
+        ret
+      }
+    } @no_frame
+
+  // ====================================================================
+  // buffer_get_line_len(addr: u64) -> u64
+  //
+  // Returns the length (bytes valid) of the line at addr. On OOB
+  // (addr == 0 or addr > buffer_count) returns BUFFER_ERR_OOB. Cursor
+  // is NOT modified.
+  //
+  // Register plan:
+  //   rdi = addr              (validated; then decremented to slot idx)
+  //   rax = len (or sentinel) (return value)
+  //   r8, r9 = scratch
+  //   No callee-save touched.
+  // ====================================================================
+  pub let buffer_get_line_len : (u64) -> u64 !{mem} =
+    fn (addr: u64) -> unsafe {
+      effects: {mem},
+      justification: "R63.M1-003 v1.2-A: length array is 512 * u64 packed as [u8; 4096] @align(8); each element sits at offset (slot_index * 8) from the base. Alignment is preserved because the base is @align(8) and every offset is a multiple of 8. Load via a plain `mov rax, [r9]` u64 read. OOB sentinel via movabs.",
+      block: {
+        cmp rdi, 0;
+        je  buffer_get_len_oob;
+        mov rax, [rip + buffer_count];
+        cmp rdi, rax;
+        ja  buffer_get_len_oob;
+
+        // slot_index = addr - 1; byte offset = slot_index * 8.
+        mov r8, rdi;
+        sub r8, 1;
+        shl r8, 3;
+        lea r9, [rip + buffer_len];
+        add r9, r8;
+        mov rax, [r9];
+        ret;
+
+      buffer_get_len_oob:
+        mov rax, 0xFFFFFFFFFFFFFF01;
+        ret
+      }
+    } @no_frame
+
+  // ====================================================================
+  // buffer_replace_line(addr, text_ptr, text_len) -> u64
+  //
+  // In-place replaces the text of the line at addr. addr must be in
+  // [1, buffer_count]; text_len must be <= 256. Sets cursor = addr on
+  // success. Returns addr on success, or the appropriate sentinel.
+  //
+  // Register plan:
+  //   rdi = addr        (validated; then decremented to slot idx)
+  //   rsi = text_ptr    (advanced by 1 per byte during the copy)
+  //   rdx = text_len    (loop bound; stored into buffer_len slot after)
+  //   r8, r9 = scratch for address composition + copy destination
+  //   rax, rcx, r11 = copy-loop scratch
+  //   No callee-save touched.
+  // ====================================================================
+  pub let buffer_replace_line : (u64, u64, u64) -> u64 !{mem} =
+    fn (addr: u64, text_ptr: u64, text_len: u64) -> unsafe {
+      effects: {mem},
+      justification: "R63.M1-003 v1.2-A: three validations (addr != 0, addr <= count, text_len <= 256) before any store; on success the byte-copy loop walks rsi forward and the destination pointer r9 forward, per-byte, using the `xor rax, rax; mov_b rax, [rsi]; mov [r9], al` narrow-load-then-byte-store idiom. Loop uses `cmp rcx, rdx; jae` (unsigned) and `add rcx, 1; jmp` (no dec+jnz -- dec+jnz would work but the add+cmp+jae shape mirrors the main.pdx §Step 10.5 newline-scan). After the copy, buffer_len[slot] is written via a plain `mov [rN], rdx` 8-byte store. Cursor is set to addr (the replaced line remains addressable, and `.` per POSIX ed §Addressing lands on the just-edited line). Return values fit imm32 (addr <= 512); errors use movabs sentinels.",
+      block: {
+        cmp rdi, 0;
+        je  buffer_replace_oob;
+        mov rax, [rip + buffer_count];
+        cmp rdi, rax;
+        ja  buffer_replace_oob;
+        cmp rdx, 256;
+        ja  buffer_replace_too_long;
+
+        // Destination pointer: &pool[(addr-1) * 256].
+        mov r8, rdi;
+        sub r8, 1;
+        shl r8, 8;
+        lea r9, [rip + buffer_pool];
+        add r9, r8;
+
+        // Byte-copy loop: for i = 0; i < text_len; i++ dst[i] = src[i].
+        xor rcx, rcx;
+      buffer_replace_copy_top:
+        cmp rcx, rdx;
+        jae buffer_replace_copy_done;
+        xor rax, rax;
+        mov_b rax, [rsi];
+        mov [r9], al;
+        add rsi, 1;
+        add r9, 1;
+        add rcx, 1;
+        jmp buffer_replace_copy_top;
+      buffer_replace_copy_done:
+
+        // Length: buffer_len[(addr-1)] = text_len.
+        mov r8, rdi;
+        sub r8, 1;
+        shl r8, 3;
+        lea r9, [rip + buffer_len];
+        add r9, r8;
+        mov [r9], rdx;
+
+        // Cursor: dot = addr.
+        mov [rip + buffer_cursor], rdi;
+
+        // Return addr (fits imm32; already in rdi).
+        mov rax, rdi;
+        ret;
+
+      buffer_replace_oob:
+        mov rax, 0xFFFFFFFFFFFFFF01;
+        ret;
+
+      buffer_replace_too_long:
+        mov rax, 0xFFFFFFFFFFFFFF03;
+        ret
+      }
+    } @no_frame
+
+  // ====================================================================
+  // buffer_insert_line(after, text_ptr, text_len) -> u64
+  //
+  // Inserts a new line after 1-based address `after` (0 == insert at
+  // head, before line 1). Shifts subsequent lines down by one slot.
+  // Validates: after <= buffer_count, buffer_count < 512, text_len <=
+  // 256. Sets cursor = after + 1 (the newly inserted line's 1-based
+  // address). Returns the new line's 1-based address on success, or a
+  // sentinel.
+  //
+  // Register plan:
+  //   rdi = after           (persist)
+  //   rsi = text_ptr        (persist for copy)
+  //   rdx = text_len        (persist for length store)
+  //   rax = count / return
+  //   r8  = loop counter i (shift phase); slot offset scratch (copy phase)
+  //   r9, r10, r11 = address composition + inter-slot payload scratch
+  //   rcx = per-slot qword counter (32 qwords per slot text) and per-
+  //         byte counter (copy phase)
+  //   No callee-save touched.
+  // ====================================================================
+  pub let buffer_insert_line : (u64, u64, u64) -> u64 !{mem} =
+    fn (after: u64, text_ptr: u64, text_len: u64) -> unsafe {
+      effects: {mem},
+      justification: "R63.M1-003 v1.2-A: three validations (after <= count, text_len <= 256, count < 512) before any store. The shift phase iterates i = count-1 downwards to `after` inclusive; for each i it copies pool[i] to pool[i+1] as 32 aligned qword moves (256 bytes / 8 = 32), and copies len[i] to len[i+1] as one aligned qword move. Reverse-order iteration prevents the destination from clobbering source data before it is read. When after == count (append), the shift is skipped entirely. The insert-at-slot phase byte-copies text_len bytes from rsi to pool[after * 256], writes text_len into len[after], increments buffer_count, sets cursor = after + 1, and returns after + 1 in rax. Every address composition uses displacement form (`lea rN, [rip + sym]; add rN, offset`) -- no scaled-index. Every shift-inner qword move is 8-byte aligned by construction (base is @align(8); offsets are multiples of 8). Error paths (OOB, POOL_FULL, LINE_TOO_LONG) all movabs their sentinel into rax before ret. No callee-save touched; @no_frame; no `test`; no `and reg, imm64`; no `imul`; reserved-label prefix `buffer_insert_`.",
+      block: {
+        // (1) Validate after <= buffer_count.
+        mov rax, [rip + buffer_count];
+        cmp rdi, rax;
+        ja  buffer_insert_oob;
+
+        // (2) Validate text_len <= 256.
+        cmp rdx, 256;
+        ja  buffer_insert_too_long;
+
+        // (3) Validate buffer_count < 512.
+        cmp rax, 512;
+        jae buffer_insert_full;
+
+        // If after == count, no shift needed (append at tail).
+        cmp rdi, rax;
+        je  buffer_insert_write;
+
+        // Shift phase: for i = count-1 down to after: pool[i]->pool[i+1].
+        mov r8, rax;
+        sub r8, 1;                          // r8 = i = count-1
+
+      buffer_insert_shift_top:
+        // Source pointer: &pool[i * 256].
+        mov r10, r8;
+        shl r10, 8;
+        lea r11, [rip + buffer_pool];
+        add r11, r10;                       // r11 = &pool[i * 256]
+        // Destination pointer: &pool[(i+1) * 256].
+        mov r10, r8;
+        add r10, 1;
+        shl r10, 8;
+        lea r9, [rip + buffer_pool];
+        add r9, r10;                        // r9 = &pool[(i+1) * 256]
+        // Copy 32 qwords (256 bytes) src -> dst.
+        mov rcx, 32;
+      buffer_insert_shift_qw_top:
+        cmp rcx, 0;
+        je  buffer_insert_shift_qw_done;
+        mov r10, [r11];
+        mov [r9], r10;
+        add r11, 8;
+        add r9, 8;
+        sub rcx, 1;
+        jmp buffer_insert_shift_qw_top;
+      buffer_insert_shift_qw_done:
+
+        // Length shift: len[i+1] = len[i].
+        mov r10, r8;
+        shl r10, 3;
+        lea r11, [rip + buffer_len];
+        add r11, r10;                       // r11 = &len[i]
+        mov r10, [r11];                     // r10 = len[i]
+        mov r11, r8;
+        add r11, 1;
+        shl r11, 3;
+        lea r9, [rip + buffer_len];
+        add r9, r11;                        // r9 = &len[i+1]
+        mov [r9], r10;
+
+        // Termination: if i == after, done; else i -= 1 and loop.
+        cmp r8, rdi;
+        je  buffer_insert_write;
+        sub r8, 1;
+        jmp buffer_insert_shift_top;
+
+      buffer_insert_write:
+        // Byte-copy text_ptr[0..text_len) into pool[after * 256].
+        mov r8, rdi;
+        shl r8, 8;
+        lea r9, [rip + buffer_pool];
+        add r9, r8;                         // r9 = &pool[after * 256]
+        xor rcx, rcx;
+      buffer_insert_copy_top:
+        cmp rcx, rdx;
+        jae buffer_insert_copy_done;
+        xor rax, rax;
+        mov_b rax, [rsi];
+        mov [r9], al;
+        add rsi, 1;
+        add r9, 1;
+        add rcx, 1;
+        jmp buffer_insert_copy_top;
+      buffer_insert_copy_done:
+
+        // Length: len[after] = text_len.
+        mov r8, rdi;
+        shl r8, 3;
+        lea r9, [rip + buffer_len];
+        add r9, r8;
+        mov [r9], rdx;
+
+        // buffer_count += 1.
+        mov rax, [rip + buffer_count];
+        add rax, 1;
+        mov [rip + buffer_count], rax;
+
+        // Cursor = after + 1 (the newly inserted line).
+        mov rax, rdi;
+        add rax, 1;
+        mov [rip + buffer_cursor], rax;
+
+        // Return new line's 1-based address (still in rax).
+        ret;
+
+      buffer_insert_oob:
+        mov rax, 0xFFFFFFFFFFFFFF01;
+        ret;
+
+      buffer_insert_too_long:
+        mov rax, 0xFFFFFFFFFFFFFF03;
+        ret;
+
+      buffer_insert_full:
+        mov rax, 0xFFFFFFFFFFFFFF02;
+        ret
+      }
+    } @no_frame
+
+  // ====================================================================
+  // buffer_delete_line(addr) -> u64
+  //
+  // Removes the line at 1-based address `addr`. Shifts subsequent lines
+  // up by one slot. Validates addr in [1, buffer_count]. Sets cursor =
+  // min(addr, new_count) per ed convention (dot moves to the line after
+  // the deleted range, or to the new last line if the delete was at
+  // the tail). Returns the new line count on success, or the sentinel.
+  //
+  // Register plan:
+  //   rdi = addr        (persist through cursor set)
+  //   rax = count       (loaded for bound check; reused for new count)
+  //   r8  = loop counter i (shift phase); addr-1 slot base
+  //   r9  = loop upper bound (count - 1)
+  //   r10, r11 = address composition + inter-slot payload scratch
+  //   rcx = per-slot qword counter (shift phase)
+  //   No callee-save touched.
+  // ====================================================================
+  pub let buffer_delete_line : (u64) -> u64 !{mem} =
+    fn (addr: u64) -> unsafe {
+      effects: {mem},
+      justification: "R63.M1-003 v1.2-A: two validations (addr != 0, addr <= count) before any store. Shift phase iterates i = addr-1 upwards while i < count-1; for each i it copies pool[i+1] to pool[i] as 32 aligned qword moves, and copies len[i+1] to len[i] as one aligned qword move. Forward iteration is safe because src (i+1) is always ahead of dst (i) and never revisited. When addr == count (delete tail), the shift loop is skipped entirely (r8 == r9 on entry, jae fires). Post-shift, buffer_count -= 1, cursor is clamped to min(addr, new_count) so a delete at the tail moves dot back and a delete elsewhere keeps dot at the same 1-based address (now referring to the previously-next line, per POSIX ed §Addressing). Returns new count in rax. Error path uses BUFFER_ERR_OOB via movabs. Encoder discipline identical to insert_line (reverse phase is missing but the loop shape mirrors).",
+      block: {
+        // (1) Validate addr in [1, buffer_count].
+        cmp rdi, 0;
+        je  buffer_delete_oob;
+        mov rax, [rip + buffer_count];
+        cmp rdi, rax;
+        ja  buffer_delete_oob;
+
+        // Shift phase: for i = addr-1 while i < count-1:
+        //   pool[i] = pool[i+1]; len[i] = len[i+1].
+        mov r8, rdi;
+        sub r8, 1;                          // r8 = i = addr-1 (0-idx of victim)
+        mov r9, rax;
+        sub r9, 1;                          // r9 = count-1 (upper bound excl.)
+
+      buffer_delete_shift_top:
+        cmp r8, r9;
+        jae buffer_delete_shrink;
+        // Source: &pool[(i+1) * 256].
+        mov r10, r8;
+        add r10, 1;
+        shl r10, 8;
+        lea r11, [rip + buffer_pool];
+        add r11, r10;                       // r11 = &pool[(i+1) * 256]
+        // Destination: &pool[i * 256].
+        mov r10, r8;
+        shl r10, 8;
+        lea rax, [rip + buffer_pool];
+        add rax, r10;                       // rax = &pool[i * 256]
+        // Copy 32 qwords src -> dst.
+        mov rcx, 32;
+      buffer_delete_shift_qw_top:
+        cmp rcx, 0;
+        je  buffer_delete_shift_qw_done;
+        mov r10, [r11];
+        mov [rax], r10;
+        add r11, 8;
+        add rax, 8;
+        sub rcx, 1;
+        jmp buffer_delete_shift_qw_top;
+      buffer_delete_shift_qw_done:
+
+        // Length shift: len[i] = len[i+1].
+        mov r10, r8;
+        add r10, 1;
+        shl r10, 3;
+        lea r11, [rip + buffer_len];
+        add r11, r10;                       // r11 = &len[i+1]
+        mov rax, [r11];                     // rax = len[i+1]
+        mov r10, r8;
+        shl r10, 3;
+        lea r11, [rip + buffer_len];
+        add r11, r10;                       // r11 = &len[i]
+        mov [r11], rax;
+
+        add r8, 1;
+        jmp buffer_delete_shift_top;
+
+      buffer_delete_shrink:
+        // buffer_count -= 1.
+        mov rax, [rip + buffer_count];
+        sub rax, 1;
+        mov [rip + buffer_count], rax;
+
+        // Cursor = min(addr, new_count).
+        mov r8, rdi;
+        cmp r8, rax;
+        jbe buffer_delete_set_cursor;
+        mov r8, rax;
+      buffer_delete_set_cursor:
+        mov [rip + buffer_cursor], r8;
+
+        // Return new count (already in rax).
+        ret;
+
+      buffer_delete_oob:
+        mov rax, 0xFFFFFFFFFFFFFF01;
+        ret
+      }
+    } @no_frame
+}
