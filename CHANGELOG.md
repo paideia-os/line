@@ -6,6 +6,18 @@ All notable changes to `paideia-os/line` (ed-clone editor) documented per Keep-a
 
 ### Added
 
+- **R63 round closure** (issue #7) — R63.M1-008 retrospective doc
+  authored at `paideia-os/design/round-retrospectives/r63-closure.md`
+  (paideia-os monorepo, co-located with the other round retros).
+  Full close: R63 scope (M1-001..006 on this satellite + M1-007
+  paideia-os#1868 kernel-side embed) is landed and interactively
+  exercised. `r63-closed` tag cut on this repo by main after the
+  retro commit lands (see the retro for the tag-cut disposition
+  and for ticket-hygiene follow-ups on #1/#2/#8 whose code landed
+  but tickets were left open, plus the paideia-as#1413 encoder
+  exit-code bug that let the buffer.pdx capabilities gap ship
+  silently before W41's debugger sweep caught it). Documentation-
+  only landing; no source touched. Closes #7.
 - **v1.4-A** (issue #5) — R63.M1-005 interactive REPL loop (`src/main.pdx`,
   module `Main`). Retires the M1-001 batch open+read+write+close round-trip
   and lands an ed-style interactive session: `[emit ':' prompt] -> [read one

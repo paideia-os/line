@@ -3,12 +3,17 @@
 **Wave:** R63 (user-space `ed`-style scriptable line editor -- paideia-os
 `design/roadmap/post-r60-daily-use-roadmap.md` §R63; Category C tier-1
 per `design/tooling/plan.md`).
-**Current milestone:** v1.1-D (R63.M1-006 fingerprint `line ok --
-lines=<N>\n` + LINE PARSE FAIL rodata marker) -- **landed**.
-Previous: v1.1-B (semantic-pipe emission wire: `LineEditRecord@0.1`
-via `sys_semantic_send` SC+ ID 115) -- landed. v1.1-A (syscall-wire;
+**Current milestone:** R63.M1-008 round closure (retro at
+`paideia-os/design/round-retrospectives/r63-closure.md`; `r63-closed`
+tag cut on this repo) -- **landed**.
+Previous: v1.4-A (R63.M1-005 interactive REPL loop) -- landed. v1.3-A
+(R63.M1-004 fileio) -- landed. v1.2-A (R63.M1-003 buffer) -- landed.
+v1.1-D (R63.M1-006 fingerprint + LINE PARSE FAIL rodata) -- landed.
+v1.1-B (semantic-pipe emission wire: `LineEditRecord@0.1` via
+`sys_semantic_send` SC+ ID 115) -- landed. v1.1-A (syscall-wire;
 retired the M1-001 STUB body) -- landed.
-**Version:** 1.1.0-D (pre-tag; a signed 1.0.0 release closes at M5).
+**Version:** 1.1.0-D (tag: `r63-closed`; a signed 1.0.0 release closes
+at M5).
 
 ## Milestone checklist
 
@@ -34,15 +39,37 @@ retired the M1-001 STUB body) -- landed.
       yet; M1-002 lands `a i d c p w q Q . , $`). Error paths emit
       NO record (no session to describe; matches pdxsock v1.1-B
       posture).
-- [ ] **M1-002** -- command grammar `a i d c p w q Q . , $`.
-- [ ] **M1-003** -- line-array buffer with 1-based addresses + edit
-      ops. When this lands, `lines_out` starts diverging from
-      `lines_in` and `edit_count` starts reporting real counts.
-- [ ] **M1-004** -- distinct `w <path>` / `e <path>` command paths.
-      `files_read` / `files_written` start reporting real counts here
-      once multiple files can be opened in one session.
-- [ ] **M1-005** -- interactive `:` prompt + line reader. Wires the
-      `LINE PARSE FAIL` marker declared at v1.1-D.
+- [x] **M1-002** -- command grammar `a i d c p w q Q . , $`. Landed
+      as part of the M1-005 REPL dispatch (tokenizer +
+      per-command handlers in `src/main.pdx`); ticket #2 remains
+      open on the tracker but the code is in-tree and downstream
+      landings built on it (see r63-closure.md §Ticket hygiene).
+- [x] **M1-003** (v1.2-A, issue #3) -- line-array buffer with
+      1-based addresses + edit ops (`src/buffer.pdx`). Fixed pool
+      of 512 lines * 256 bytes; API: `buffer_insert_line` /
+      `buffer_delete_line` / `buffer_replace_line` /
+      `buffer_get_line_ptr` / `buffer_get_line_len` /
+      `buffer_last_addr` / `buffer_cursor_get` / `buffer_cursor_set`.
+      Sentinels in `0xFFFFFFFFFFFFFF01..03`. Once dispatch drives
+      edits through this module (M1-005), `lines_out` diverges from
+      `lines_in` and `edit_count` reports real counts.
+- [x] **M1-004** (v1.3-A, issue #4) -- distinct `w <path>` /
+      `e <path>` command paths (`src/fileio.pdx`).
+      `fileio_write_buffer` opens `O_CREAT|O_WRONLY|O_TRUNC` (mode
+      `0644`) and writes every line + `'\n'`; `fileio_read_file`
+      streams a 4 KiB chunk buffer, splits on `'\n'`, appends via
+      `buffer_insert_line`. Sentinels in `0xFFFFFFFFFFFFFF11..13`.
+      `files_read` / `files_written` in the semantic record remain
+      at 0 pending an M2-002 per-command counter wire.
+- [x] **M1-005** (v1.4-A, issue #5) -- interactive `:` prompt +
+      per-byte fd-0 line reader (`src/main.pdx`). Address+command
+      tokenizer, dispatch of `a i d c p w q Q . , $` + bare
+      address. Fingerprint + `LineEditRecord@0.1` emit sites moved
+      from the retired v1.1-A batch tail to the `q` handler; wire
+      format unchanged. Every buffer/fileio sentinel path emits
+      `?\n` (matches ed's single-character error convention) and
+      returns to the prompt. Unblocked by line#12 buffer.pdx
+      capabilities hotfix.
 - [x] **M1-006** (v1.1-D) -- `line ok -- lines=<N>\n` fingerprint on
       the happy-path tail (three sys_writes to fd 1: prefix
       `line ok -- lines=` + variable decimal via `line_print_u64_dec`
@@ -60,6 +87,17 @@ retired the M1-001 STUB body) -- landed.
       (reserved). `q` command not yet in play (the fingerprint fires
       at the round-trip tail today; will move to the `q` handler at
       M1-005 without a wire-format change).
+- [x] **M1-007** -- paideia-os#1868 kernel-side
+      `src/kernel/bin_seeds.pdx` extension embedding `line.elf` at
+      `/bin/line` via the R61 tmpfs-seed symbol-pair +
+      `witness_bin_seeds` shape. Closed 2026-08-25.
+- [x] **M1-008** (issue #7) -- round closure: retro landed at
+      `paideia-os/design/round-retrospectives/r63-closure.md`;
+      `r63-closed` tag cut on this repo by main after the retro
+      commit lands. See the retro for ticket-hygiene follow-ups on
+      #1/#2/#8 and the paideia-as#1413 exit-code encoder bug that
+      let the buffer.pdx capabilities gap ship silently before
+      W41's debugger sweep caught it.
 
 ### M2 -- (deferred) module split + libpdx-audit
 
