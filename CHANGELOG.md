@@ -6,6 +6,75 @@ All notable changes to `paideia-os/line` (ed-clone editor) documented per Keep-a
 
 ### Added
 
+- **v1.4-A** (issue #5) — R63.M1-005 interactive REPL loop (`src/main.pdx`,
+  module `Main`). Retires the M1-001 batch open+read+write+close round-trip
+  and lands an ed-style interactive session: `[emit ':' prompt] -> [read one
+  line from fd 0 via per-byte sys_read] -> [tokenize address + command +
+  arg] -> [dispatch] -> [loop]`. Supported grammar at v1.4-A: addresses
+  `.` (buffer_cursor_get), `$` (buffer_last_addr), decimal literal `<N>`,
+  range `<A1>,<A2>` (`,` shorthand expands to `1,$`); commands `q` (soft
+  quit -- emits R63.M1-006 fingerprint `line ok -- lines=<N>\n` and
+  LineEditRecord@0.1 via sys_semantic_send SC+ ID 115, then sys_exit(0)),
+  `Q` (hard quit -- sys_exit(0) with no emit; matches POSIX ed's discard-
+  unsaved-changes convention), `w <path>` (fileio_write_buffer),
+  `e <path>` (fileio_read_file), `p` (print addr1..addr2), `d` (delete
+  addr1..addr2), `a` / `i` / `c` (append/insert/change input-mode --
+  reads lines from fd 0 until a lone `.` and inserts each via
+  buffer_insert_line, incrementing main_edit_count per success), bare
+  address (moves cursor and prints). EOF on fd 0 with no bytes accumulated
+  is treated as an implicit `q`. Line reader is per-byte `sys_read(0,
+  &line_buf[i], 1)` (SC+ ID 0) rather than libc getline -- paideia-os has
+  no libc at R63; correct and simple for the interactive shell (one
+  syscall per keystroke on a tty is what bash does at the read-a-command
+  layer). Error-shape: every buffer_* / fileio_* sentinel return
+  (`cmp rax, 512; ja` for buffer's `[1,512]` band and
+  `cmp rax, 0; jne` for fileio's `{0=OK}`) triggers a single
+  `sys_write(1, "?\n", 2)` and jumps back to the prompt -- never
+  sys_exit'd mid-session. Unknown-command byte, malformed address, and
+  missing `w`/`e` path use the SAME `?\n` wire. The fingerprint and
+  LineEditRecord emit sites MOVE from the retired batch-mode tail to
+  the `q` handler; wire format is unchanged (v1.1-B/D verbatim);
+  `<N>` now reads `buffer_last_addr()` at exit-time instead of counting
+  `'\n'` bytes in a scratch buffer, so a session `e foo -> q` reports
+  the count of lines that landed in the buffer. `edit_count` in the
+  record tracks successful `a` / `i` / `c` / `d` operations
+  (incremented at each buffer_insert_line / buffer_delete_line success
+  site). `files_read` / `files_written` remain 0 at v1.4-A pending a
+  per-command counter wire that lands with M2-002 audit integration.
+  Four new local helpers: `main_read_line` (per-byte fd-0 line reader,
+  returns len or MAIN_ERR_EOF=`0xFFFFFFFFFFFFFF20`), `main_parse_line`
+  (address + command tokenizer, writes to `main_addr1_set/main_addr1/
+  main_addr2_set/main_addr2/main_cmd/main_arg_ofs/main_arg_len` .bss
+  slots), `main_input_mode(after)` (reads lines until lone `.` and
+  inserts each; returns MAIN_ERR_PARSE=`0xFFFFFFFFFFFFFF21` on buffer
+  sentinel), `main_print_addr(addr)` (single-line print with trailing
+  `'\n'`). Sentinel band `0xFFFFFFFFFFFFFF20..0x2F` is disjoint from
+  buffer.pdx's `0x01..0x03` and fileio.pdx's `0x11..0x13` sub-bands.
+  Encoder pitfall discipline v0.36+: `capabilities: {...}` on every
+  `pub let :sig = fn ...` (matches P0154 tracked in line#12); reserved-
+  label prefixes (`mrl_`, `mpl_`, `mim_`, `mpa_`, `repl_`, `line_pud_`);
+  no `test reg,reg`; no `and reg,imm64`; no 2-op `imul r,imm` (decimal
+  parse uses `<<3 + <<1` = 10x fold); no scaled-index; byte-load
+  `xor rax,rax; mov_b rax,[rN]`; byte-store `mov [rN], al`; movabs for
+  the three imm64 constants (`0xFFFFFFFFFFFFFF20`,
+  `0xFFFFFFFFFFFFFF21`, `0x656E694C69644500`) with every other
+  immediate fitting imm32. SysV alignment: `_start` is @no_frame with
+  zero pushes (PVH loader contract: entry rsp %16 == 0); helpers that
+  make nested calls push an ODD number of callee-save regs (1 push in
+  `main_parse_line` / `main_input_mode` / `main_print_addr` = +16 bytes
+  incl. return addr, rsp %16 == 0 at every nested call site).
+
+  **Known blocker (NOT introduced here; tracked separately):** line#12
+  P0154 hotfix -- `src/buffer.pdx`'s 8 public function declarations
+  are missing `capabilities: {},` between `effects:` and
+  `justification:` and `@{}` on the outer signature. Until #12 lands
+  the field-insertion patch, this REPL will NOT link even though
+  main.pdx itself parses cleanly (main.pdx declares `capabilities:`
+  on every fn per the requirement -- the blocker sits entirely in
+  buffer.pdx). Build failure is EXPECTED at this landing; fixing #12
+  unblocks the smoke round-trip.
+
+  Closes #5.
 - **v1.3-A** (issue #4) — R63.M1-004 file I/O (`src/fileio.pdx`, module
   `Fileio`). Two public entry points backing the ed-style `w <path>`
   (write buffer to file) and `e <path>` (read file into buffer) commands

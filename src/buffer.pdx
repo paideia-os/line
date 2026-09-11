@@ -246,9 +246,10 @@ module Buffer = structure {
   // convention: `$` on an empty buffer refers to line 0, i.e. the
   // pre-line-1 sentinel).
   // ====================================================================
-  pub let buffer_last_addr : () -> u64 !{mem} =
+  pub let buffer_last_addr : () -> u64 !{mem} @{} =
     fn () -> unsafe {
       effects: {mem},
+      capabilities: {},
       justification: "R63.M1-003 v1.2-A: return buffer_count as-is. `$` in the M1-002 ed grammar addresses the last line; when the buffer is empty, the caller sees 0 and must map that to the ed `?` error or accept 0 as the pre-line-1 sentinel per the dispatch policy landed at M1-005. Reads one u64 from .bss (rip-relative load); no other memory access; no bounds risk. @no_frame because the body is one load + ret; no scratch beyond rax; no callee-save touched.",
       block: {
         mov rax, [rip + buffer_count];
@@ -263,9 +264,10 @@ module Buffer = structure {
   // 0 is the "before line 1" sentinel (empty buffer, or a `cursor_set`
   // call with addr == 0).
   // ====================================================================
-  pub let buffer_cursor_get : () -> u64 !{mem} =
+  pub let buffer_cursor_get : () -> u64 !{mem} @{} =
     fn () -> unsafe {
       effects: {mem},
+      capabilities: {},
       justification: "R63.M1-003 v1.2-A: return buffer_cursor as-is. `.` in the M1-002 ed grammar addresses the current line; the caller (dispatch at M1-005) is responsible for translating a 0 return to the ed `?` diagnostic when 0 is not a valid target for the requesting command (e.g. `p` on line 0). Symmetric with buffer_last_addr: one rip-relative load + ret. @no_frame; no scratch beyond rax.",
       block: {
         mov rax, [rip + buffer_cursor];
@@ -285,9 +287,10 @@ module Buffer = structure {
   //   rax = count       (loaded for bounds check; overwritten on return)
   //   All scratch inside the caller-save set. No callee-save touched.
   // ====================================================================
-  pub let buffer_cursor_set : (u64) -> u64 !{mem} =
+  pub let buffer_cursor_set : (u64) -> u64 !{mem} @{} =
     fn (addr: u64) -> unsafe {
       effects: {mem},
+      capabilities: {},
       justification: "R63.M1-003 v1.2-A: cursor is a plain u64 slot; validation is `addr <= buffer_count` (unsigned, `ja` branches OOB). No signed-vs-unsigned hazard because both operands are u64 in [0, 512]. OK path stores rdi into the slot and returns rdi; OOB path movabs's BUFFER_ERR_OOB (0xFFFFFFFFFFFFFF01) into rax. @no_frame + reserved-label prefix + no `test` + no `and reg, imm64`.",
       block: {
         mov rax, [rip + buffer_count];
@@ -321,9 +324,10 @@ module Buffer = structure {
   //   r8, r9 = scratch for address composition
   //   No callee-save touched.
   // ====================================================================
-  pub let buffer_get_line_ptr : (u64) -> u64 !{mem} =
+  pub let buffer_get_line_ptr : (u64) -> u64 !{mem} @{} =
     fn (addr: u64) -> unsafe {
       effects: {mem},
+      capabilities: {},
       justification: "R63.M1-003 v1.2-A: (addr-1) * 256 is a `shl reg, 8` on a u64 that has just been range-checked to [1, 512], so the shift cannot overflow (max value 511 << 8 = 130816, well within u64). Address composition uses `lea rN, [rip + buffer_pool]; add rN, offset` (displacement chain) rather than `[reg + N*idx]` per the encoder-pitfall v0.36+ scaled-index avoidance. OOB uses BUFFER_ERR_OOB via movabs.",
       block: {
         cmp rdi, 0;
@@ -359,9 +363,10 @@ module Buffer = structure {
   //   r8, r9 = scratch
   //   No callee-save touched.
   // ====================================================================
-  pub let buffer_get_line_len : (u64) -> u64 !{mem} =
+  pub let buffer_get_line_len : (u64) -> u64 !{mem} @{} =
     fn (addr: u64) -> unsafe {
       effects: {mem},
+      capabilities: {},
       justification: "R63.M1-003 v1.2-A: length array is 512 * u64 packed as [u8; 4096] @align(8); each element sits at offset (slot_index * 8) from the base. Alignment is preserved because the base is @align(8) and every offset is a multiple of 8. Load via a plain `mov rax, [r9]` u64 read. OOB sentinel via movabs.",
       block: {
         cmp rdi, 0;
@@ -400,9 +405,10 @@ module Buffer = structure {
   //   rax, rcx, r11 = copy-loop scratch
   //   No callee-save touched.
   // ====================================================================
-  pub let buffer_replace_line : (u64, u64, u64) -> u64 !{mem} =
+  pub let buffer_replace_line : (u64, u64, u64) -> u64 !{mem} @{} =
     fn (addr: u64, text_ptr: u64, text_len: u64) -> unsafe {
       effects: {mem},
+      capabilities: {},
       justification: "R63.M1-003 v1.2-A: three validations (addr != 0, addr <= count, text_len <= 256) before any store; on success the byte-copy loop walks rsi forward and the destination pointer r9 forward, per-byte, using the `xor rax, rax; mov_b rax, [rsi]; mov [r9], al` narrow-load-then-byte-store idiom. Loop uses `cmp rcx, rdx; jae` (unsigned) and `add rcx, 1; jmp` (no dec+jnz -- dec+jnz would work but the add+cmp+jae shape mirrors the main.pdx §Step 10.5 newline-scan). After the copy, buffer_len[slot] is written via a plain `mov [rN], rdx` 8-byte store. Cursor is set to addr (the replaced line remains addressable, and `.` per POSIX ed §Addressing lands on the just-edited line). Return values fit imm32 (addr <= 512); errors use movabs sentinels.",
       block: {
         cmp rdi, 0;
@@ -480,9 +486,10 @@ module Buffer = structure {
   //         byte counter (copy phase)
   //   No callee-save touched.
   // ====================================================================
-  pub let buffer_insert_line : (u64, u64, u64) -> u64 !{mem} =
+  pub let buffer_insert_line : (u64, u64, u64) -> u64 !{mem} @{} =
     fn (after: u64, text_ptr: u64, text_len: u64) -> unsafe {
       effects: {mem},
+      capabilities: {},
       justification: "R63.M1-003 v1.2-A: three validations (after <= count, text_len <= 256, count < 512) before any store. The shift phase iterates i = count-1 downwards to `after` inclusive; for each i it copies pool[i] to pool[i+1] as 32 aligned qword moves (256 bytes / 8 = 32), and copies len[i] to len[i+1] as one aligned qword move. Reverse-order iteration prevents the destination from clobbering source data before it is read. When after == count (append), the shift is skipped entirely. The insert-at-slot phase byte-copies text_len bytes from rsi to pool[after * 256], writes text_len into len[after], increments buffer_count, sets cursor = after + 1, and returns after + 1 in rax. Every address composition uses displacement form (`lea rN, [rip + sym]; add rN, offset`) -- no scaled-index. Every shift-inner qword move is 8-byte aligned by construction (base is @align(8); offsets are multiples of 8). Error paths (OOB, POOL_FULL, LINE_TOO_LONG) all movabs their sentinel into rax before ret. No callee-save touched; @no_frame; no `test`; no `and reg, imm64`; no `imul`; reserved-label prefix `buffer_insert_`.",
       block: {
         // (1) Validate after <= buffer_count.
@@ -621,9 +628,10 @@ module Buffer = structure {
   //   rcx = per-slot qword counter (shift phase)
   //   No callee-save touched.
   // ====================================================================
-  pub let buffer_delete_line : (u64) -> u64 !{mem} =
+  pub let buffer_delete_line : (u64) -> u64 !{mem} @{} =
     fn (addr: u64) -> unsafe {
       effects: {mem},
+      capabilities: {},
       justification: "R63.M1-003 v1.2-A: two validations (addr != 0, addr <= count) before any store. Shift phase iterates i = addr-1 upwards while i < count-1; for each i it copies pool[i+1] to pool[i] as 32 aligned qword moves, and copies len[i+1] to len[i] as one aligned qword move. Forward iteration is safe because src (i+1) is always ahead of dst (i) and never revisited. When addr == count (delete tail), the shift loop is skipped entirely (r8 == r9 on entry, jae fires). Post-shift, buffer_count -= 1, cursor is clamped to min(addr, new_count) so a delete at the tail moves dot back and a delete elsewhere keeps dot at the same 1-based address (now referring to the previously-next line, per POSIX ed §Addressing). Returns new count in rax. Error path uses BUFFER_ERR_OOB via movabs. Encoder discipline identical to insert_line (reverse phase is missing but the loop shape mirrors).",
       block: {
         // (1) Validate addr in [1, buffer_count].
