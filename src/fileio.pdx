@@ -1,0 +1,619 @@
+// src/fileio.pdx -- line.M1-004 v1.3-A --
+// R63.M1-004 (paideia-os/line#4): file I/O for the ed-style command
+// grammar's `w <path>` (write buffer -> file) and `e <path>` (read file
+// -> buffer) commands. Two public entry points, both driven by the
+// M1-005 dispatch layer once the interactive `:` prompt lands.
+//
+// -----------------------------------------------------------------------
+// Scope at this landing (v1.3-A)
+// -----------------------------------------------------------------------
+//
+// Two public functions, one shared 4 KiB stream buffer, one shared
+// scratch u64. Both functions use the raw sys_open / sys_read /
+// sys_write / sys_close inline-syscall pattern (SC+ IDs 0, 1, 2, 3;
+// same discipline as main.pdx and cat.pdx), and both talk to the
+// M1-003 Buffer module through direct `call buffer_*` cross-module
+// symbol references (paideia-as resolves cross-module symbols by name
+// without any `use` / `import` header, per the shell.pdx / dispatch.pdx
+// precedent).
+//
+//   fileio_write_buffer(path_ptr: u64) -> u64
+//     sys_open(path, O_CREAT|O_WRONLY|O_TRUNC = 0x241, mode = 0644 =
+//     0x1A4). fd-gate: `cmp rax, 32; jae` catches both an out-of-range
+//     fd AND any bit-63-set negative errno (paideia-os ls.pdx precedent
+//     -- valid user fds live in [3, 32)). For each addr in [1, count]:
+//       ptr = buffer_get_line_ptr(addr)
+//       len = buffer_get_line_len(addr)
+//       sys_write(fd, ptr, len)
+//       sys_write(fd, "\n", 1)
+//     sys_close(fd). Returns LINE_OK (0) on success, LINE_ERR_OPEN_FAIL
+//     (0xFFFFFFFFFFFFFF11) if sys_open's fd-gate fires, or LINE_ERR_
+//     WRITE_FAIL (0xFFFFFFFFFFFFFF12) if any sys_write returns a
+//     negative-errno (bit 63 set). On write failure, fd is closed
+//     before returning (matches main.pdx line_write_err posture).
+//
+//   fileio_read_file(path_ptr: u64) -> u64
+//     sys_open(path, O_RDONLY = 0, mode = 0). Same fd-gate as above.
+//     Streams the file into fileio_stream_buf (4 KiB) in chunks; scans
+//     each chunk for '\n' bytes and appends complete lines to the
+//     Buffer via `buffer_insert_line(buffer_last_addr(), ptr, len)`.
+//     Bytes after the last '\n' in a chunk are memmove'd to the front
+//     as "residual" for the next iteration; the next sys_read fills
+//     buf + residual_len with (4096 - residual_len) bytes. On EOF
+//     (sys_read returns 0), any residual left over (file did not end
+//     with '\n') is inserted as one final line. Returns LINE_OK (0)
+//     on success, LINE_ERR_OPEN_FAIL if the fd-gate fires, LINE_ERR_
+//     READ_FAIL (0xFFFFFFFFFFFFFF13) if sys_read returns negative-
+//     errno OR if a single line spans a full 4 KiB chunk without any
+//     '\n' (progress guard -- otherwise we would spin forever with a
+//     residual that never shrinks).
+//
+// -----------------------------------------------------------------------
+// Trailing newline handling (spelled out for the M1-005 verification)
+// -----------------------------------------------------------------------
+//
+// The scan discipline is: every '\n' byte closes the current line and
+// starts a new (empty) line at the next byte. On EOF, if the file
+// ended with '\n', the residual is 0 -- no phantom empty line is
+// inserted at the tail; the buffer contains exactly the N lines the
+// file had. If the file did NOT end with '\n', the trailing chunk
+// (line_start .. total) is inserted as a single final line with the
+// bytes that appear before EOF, preserving the "line without trailing
+// newline" idiom common in text files edited outside ed.
+//
+// The symmetric contract on the write side is: fileio_write_buffer
+// ALWAYS emits a trailing '\n' after every line, INCLUDING the last
+// one. Round-tripping `e <path>` -> (no edits) -> `w <path>` on a
+// file that did not originally end with '\n' therefore adds one
+// trailing '\n' to the written file. This is the ed convention (POSIX
+// ed §"Regular Expressions and Addresses" implies newline termination
+// on every line) and matches the behaviour of GNU ed and BSD ed on
+// the same input.
+//
+// -----------------------------------------------------------------------
+// Error sentinels (same 0xFFFFFFFFFFFFFF0N band as buffer.pdx)
+// -----------------------------------------------------------------------
+//
+// The sentinels are declared in a disjoint sub-band from buffer.pdx's
+// (buffer uses 0x01..0x03; fileio uses 0x11..0x13) so the M1-005
+// dispatch layer can pattern-match the low byte back to the module of
+// origin without a range collision. The band is disjoint from every
+// valid u64 return in this file: fileio_write_buffer and fileio_read_
+// file both return 0 on success (LINE_OK) and top-bit-set sentinels
+// on failure, so the caller's classification is `if rax > 512 { err }`
+// exactly as in buffer.pdx.
+//
+//   LINE_OK                = 0                     -- success
+//   LINE_ERR_OPEN_FAIL     = 0xFFFFFFFFFFFFFF11    -- sys_open fd-gate
+//   LINE_ERR_WRITE_FAIL    = 0xFFFFFFFFFFFFFF12    -- sys_write < 0
+//   LINE_ERR_READ_FAIL     = 0xFFFFFFFFFFFFFF13    -- sys_read < 0 OR
+//                                                    line > 4 KiB
+//
+// All three failure sentinels have bit 63 set; they load via
+// `mov r64, imm64` (movabs), matching buffer.pdx §"Error sentinels"
+// and pdxsock/src/main.pdx §pdxsock_schema_sock_session. The band is
+// distinct from main.pdx's process-exit codes {0, 2, 3, 4, 5} because
+// those are per-process exit statuses (byte-wide via sys_exit) and
+// these are per-call u64 return values.
+//
+// -----------------------------------------------------------------------
+// Storage layout (.bss + rodata)
+// -----------------------------------------------------------------------
+//
+//   fileio_stream_buf : [u8; 4096]  -- @align(8) .bss scratch used by
+//                                      fileio_read_file both as the
+//                                      sys_read destination AND as the
+//                                      workspace where the '\n'-scan
+//                                      walks. Sized to the paideia-os
+//                                      "one-page transfer sweet spot"
+//                                      (matches main.pdx line_buf,
+//                                      cat.pdx, dmesg.pdx and every
+//                                      other tree-wide read-a-page
+//                                      pattern). Not touched by
+//                                      fileio_write_buffer -- writes
+//                                      run straight out of buffer.pdx's
+//                                      buffer_pool via the pointer
+//                                      returned by buffer_get_line_ptr.
+//   fileio_scratch    : u64         -- generic single-cell scratch
+//                                      used by fileio_write_buffer to
+//                                      stash the line pointer across
+//                                      the `call buffer_get_line_len`
+//                                      that separates it from the
+//                                      sys_write consumer. .bss (starts
+//                                      at 0). Single-threaded editor
+//                                      -- no re-entrancy hazard.
+//   fileio_newline    : [u8; 2]     -- rodata "\n\0"; the 1-byte
+//                                      trailing newline emitted after
+//                                      every line by fileio_write_
+//                                      buffer. Declared as [u8; 2]
+//                                      (char + NUL) per the tree-wide
+//                                      rodata length convention; the
+//                                      wire length passed to sys_write
+//                                      is 1 (the NUL is not written).
+//
+// -----------------------------------------------------------------------
+// Register + calling-convention plan
+// -----------------------------------------------------------------------
+//
+// Both entries take a single u64 in rdi (SysV amd64) and return u64 in
+// rax. Both enter with rsp % 16 == 8 (call has pushed the return
+// address on top of the caller's aligned %16 == 0 rsp) and both leave
+// with rsp restored to that state, ret pointing at the caller's
+// instruction after the call.
+//
+// fileio_write_buffer uses three SysV callee-save regs (rbx, r12, r13);
+// pushing all three at entry adds 24 bytes to the frame, making
+// rsp % 16 == 0 at every nested `call` site (8 + 24 = 32; 32 % 16 == 0).
+// Pop-in-reverse at every terminal path restores the caller's frame.
+//
+// fileio_read_file uses five SysV callee-save regs (rbx, r12, r13, r14,
+// r15); pushing all five adds 40 bytes, making rsp % 16 == 0 at every
+// nested `call` (8 + 40 = 48; 48 % 16 == 0). Pop-in-reverse at every
+// terminal path restores the caller's frame.
+//
+// Both entries are @no_frame -- the manual push/pop of callee-saves
+// replaces the auto rbp prologue, matching shell.pdx §shell_read_line
+// posture (which also does manual push/pop on top of an @no_frame
+// definition). SYSCALL is amd64-fast-syscall (clobbers only rax/rcx/
+// r11); `call buffer_*` respects SysV callee-save (buffer.pdx entries
+// are @no_frame + caller-save-only scratch). So every callee-save reg
+// we push at entry survives every syscall AND every buffer_* call in
+// the body unchanged.
+//
+// -----------------------------------------------------------------------
+// Encoder guardrails (paideia-as v0.36+; matches buffer.pdx §Encoder)
+// -----------------------------------------------------------------------
+//
+// * Reserved-label prefix: every internal label is `fileio_` prefixed
+//   to avoid the reserved-keyword collision (loop / if / else / for /
+//   while / match / return per feedback_paideia_as_reserved_labels).
+// * No `test reg, reg` -- every zero-check is `cmp reg, 0`.
+// * No `and reg, imm64` -- no wide masks needed.
+// * No 2-op `imul r, imm` -- no multiplication anywhere.
+// * No scaled-index `[reg + N*idx]` -- every base+offset is composed
+//   as `lea rN, [rip + sym]; add rN, offset`.
+// * Byte-load idiom `xor rax, rax; mov_b rax, [rN]` (mov_b does not
+//   zero-extend on its own -- narrow-load precedent per main.pdx
+//   §Step 10.5 and buffer.pdx §buffer_replace_line).
+// * `mov r64, imm32` for every small immediate (0x241 = 577, 0x1A4 =
+//   420, 4096, 512, 32, 10 all fit imm32 by a wide margin); movabs
+//   only for the three sentinels (top bit set).
+// * `lea rN, [rip + sym]` for every rodata / .bss address load.
+// * Module basename `Fileio` matches filename `fileio.pdx` (PascalCase,
+//   no directory prefix) per module-basename-pascal.
+// * Unsigned comparisons (ja / jae / jb / jbe) for every bounds check
+//   because inputs are u64.
+// * fd-gate `cmp rax, 32; jae` catches both a fd >= 32 (impossible for
+//   a valid fd today; user fd table is [3, 32)) and any bit-63-set
+//   negative errno (`cmp` treats operands as unsigned; a negative-errno
+//   as unsigned dwarfs 32). ls.pdx / cp.pdx / mkdir.pdx all use this
+//   idiom. Note: the [3, 32) upper bound is a paideia-os R57.M4-001
+//   contract (user fd table capacity, not a POSIX guarantee); when
+//   the kernel grows that table, this gate widens in lockstep across
+//   the tree.
+// * Sys_read/sys_write negative-return check `cmp rax, 0; jl` uses
+//   signed compare -- a valid short return is >= 0 (0 for EOF, count
+//   otherwise) and only negative-errno returns bit-63-set.
+// * buffer_insert_line return check `cmp rax, 512; ja` uses unsigned
+//   compare -- valid returns are in [1, 512] (BUFFER_MAX_LINES) and
+//   every buffer.pdx error sentinel has bit 63 set (dwarfs 512 as
+//   unsigned).
+//
+// -----------------------------------------------------------------------
+// Effects / capabilities
+// -----------------------------------------------------------------------
+//
+// {mem, sysreg} covers rip-relative reads/writes of fileio_stream_buf,
+// fileio_scratch, fileio_newline, the .bss reads through the caller-
+// supplied path_ptr on the sys_open shim, AND every SYSCALL clobber.
+// @{fs} covers the four fs-gated syscalls (sys_read/sys_write/sys_
+// open/sys_close), matching the caller declaration in main.pdx and
+// the cat.pdx / cp.pdx precedent. No {sched} -- neither entry calls
+// sys_exit; termination is via ret back to the M1-005 dispatch loop.
+// buffer_* calls are pure `!{mem}` and compose additively.
+
+module Fileio = structure {
+
+  // --------------------------------------------------------------------
+  // Error sentinels (line/ own return-value failure band; same
+  // 0xFFFFFFFFFFFFFF0N shape as buffer.pdx but in the 0x11..0x13
+  // sub-band). Top 56 bits all 1; low byte identifies the cause. All
+  // three fit only in an imm64, so callsites use `mov r64, imm64`
+  // (movabs) to load them. See file header §"Error sentinels" for the
+  // disjoint-band argument vs both buffer.pdx and the process-exit
+  // codes in main.pdx.
+  // --------------------------------------------------------------------
+  pub let fileio_ok                  : u64 = 0
+  pub let fileio_err_open_fail       : u64 = 0xFFFFFFFFFFFFFF11
+  pub let fileio_err_write_fail      : u64 = 0xFFFFFFFFFFFFFF12
+  pub let fileio_err_read_fail       : u64 = 0xFFFFFFFFFFFFFF13
+
+  // --------------------------------------------------------------------
+  // Storage pools (see file header §"Storage layout").
+  //
+  // fileio_stream_buf: 4 KiB @align(8) uninit .bss. Read-side workspace
+  // ONLY (fileio_read_file); untouched by fileio_write_buffer.
+  //
+  // fileio_scratch: single u64, .bss (starts at 0). Used by fileio_
+  // write_buffer to stash the line pointer between the buffer_get_line_
+  // ptr and buffer_get_line_len calls (avoids a stack shuffle in the
+  // hot loop). Single-threaded editor -- re-entrancy is not a concern
+  // at R63.
+  //
+  // fileio_newline: 1-byte "\n" (rodata). Emitted after every line by
+  // fileio_write_buffer.
+  // --------------------------------------------------------------------
+  pub let mut fileio_stream_buf      : [u8; 4096] = uninit @align(8)
+  pub let mut fileio_scratch         : u64        = 0
+  pub let fileio_newline             : [u8; 2]    = "\n\0"
+
+  // ====================================================================
+  // fileio_write_buffer(path_ptr: u64) -> u64
+  //
+  // Writes the Buffer module's line-array to `path`. Creates the file
+  // if missing, truncates if present, mode 0644. Every line is followed
+  // by a single '\n' byte, INCLUDING the last (see file header §
+  // "Trailing newline handling"). Returns LINE_OK on success or the
+  // appropriate LINE_ERR_* sentinel on the first failure encountered.
+  //
+  // Register plan:
+  //   rbx = fd            (survives sys_write + buffer_* calls)
+  //   r12 = line count    (loaded once via buffer_last_addr; the buffer
+  //                        does not change during the write, so this
+  //                        stays valid for the whole loop)
+  //   r13 = current addr  (1-based, iterated from 1 to r12 inclusive)
+  //   fileio_scratch      = saved line pointer between the two per-line
+  //                         buffer_* calls
+  // ====================================================================
+  pub let fileio_write_buffer : (u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (path_ptr: u64) -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {fs},
+      justification: "R63.M1-004 v1.3-A (paideia-os/line#4): open-create-truncate + per-line write loop for the ed-style `w <path>` command. Sequence: (0) prologue: push rbx / r12 / r13 (three SysV callee-save regs, 24 bytes -- brings rsp %16 to 0 at every nested `call` site given the entry rsp %16 == 8 established by the caller's `call fileio_write_buffer`). (1) sys_open(path, O_CREAT|O_WRONLY|O_TRUNC = 0x241, mode = 0644 = 0x1A4) via SC+ ID 2 -- rdi arrives with path_ptr from the caller (no reload needed); rsi = 0x241, rdx = 0x1A4, rax = 2, syscall. fd-gate `cmp rax, 32; jae` per ls.pdx precedent -- valid user fd in [3, 32), any bit-63-set negative-errno as unsigned dwarfs 32. Failure -> LINE_ERR_OPEN_FAIL (0xFFFFFFFFFFFFFF11 via movabs); success stores fd in rbx. (2) count = buffer_last_addr() -- SysV `call` respects callee-save so rbx survives. Store in r12. (3) if count == 0, skip straight to sys_close + LINE_OK (empty buffer writes an empty file, which is the right ed semantics). (4) r13 = 1 (first 1-based addr). Loop: (a) rdi = r13, `call buffer_get_line_ptr` -- rax = &pool[slot]; stash in fileio_scratch (.bss slot; avoids a stack push/pop pair inside the hot loop and preserves 16-B alignment). (b) rdi = r13, `call buffer_get_line_len` -- rax = len. (c) sys_write(rbx, [fileio_scratch], rax) via SC+ ID 1 -- rdi = rbx, rsi = [rip + fileio_scratch], rdx = rax (len), rax = 1, syscall. `cmp rax, 0; jl` catches the -errno signed-negative return; on failure jump to fileio_write_write_fail (which closes fd before returning LINE_ERR_WRITE_FAIL, matching main.pdx line_write_err posture). (d) sys_write(rbx, fileio_newline, 1) via SC+ ID 1 -- rdi = rbx, lea rsi = fileio_newline, rdx = 1, rax = 1, syscall. Same negative-return check. (e) r13 += 1; `cmp r13, r12; jbe fileio_write_loop` (unsigned <= per the invariant r13 <= r12 <= 512). (5) fd close + LINE_OK: sys_close(rbx) via SC+ ID 3 (return ignored per the BSD cat / main.pdx precedent -- vnode slot leaks a bit on close failure but does not corrupt state); xor rax, rax; pop r13 / r12 / rbx; ret. (6) Error paths (fileio_write_open_fail, fileio_write_write_fail): each movabs's the appropriate sentinel into rax; write_fail additionally close-syscalls fd first so we do not leak the vnode. Both pop the three callee-saves before ret. Encoder posture: no `test`, no `and reg, imm64`, no 2-op `imul`, no scaled-index, byte-store `mov [rN], al` idiom not used here (no per-byte writes on this path), reserved-label prefix `fileio_write_`, module basename Fileio matches filename fileio.pdx per module-basename-pascal. All immediates fit imm32 (0x241 = 577, 0x1A4 = 420, 32, 512, 1, 2, 3) so `mov r64, imm32` sign-extends to positive u64 without the errno.pdx §613 MOVABS-verbatim-load hazard. Sentinels loaded via `mov r64, imm64` movabs (top bit set precludes imm32). Effects {mem, sysreg} + @{fs} capability declaration matches main.pdx's syscall-issuing arms; buffer_* calls are pure !{mem} and compose additively.",
+      block: {
+        // ---- (0) Prologue: save callee-save registers we clobber. ----
+        push rbx;
+        push r12;
+        push r13;
+
+        // ---- (1) sys_open(path, O_CREAT|O_WRONLY|O_TRUNC, 0644). ----
+        // path_ptr arrived in rdi from the caller and has not been
+        // clobbered by the three pushes.
+        mov rsi, 0x241;                     // O_CREAT|O_WRONLY|O_TRUNC
+        mov rdx, 0x1A4;                     // mode = 0644
+        mov rax, 2;                         // SC+ ID 2 = sys_open
+        syscall;
+
+        // fd-gate: valid user fd in [3, 32); any negative-errno as
+        // unsigned dwarfs 32. Both fail the same way.
+        cmp rax, 32;
+        jae fileio_write_open_fail;
+        mov rbx, rax;                       // rbx = fd
+
+        // ---- (2) Load line count from Buffer module. ----
+        call buffer_last_addr;
+        mov r12, rax;                       // r12 = count
+
+        // ---- (3) Empty buffer -> nothing to write, just close. ----
+        cmp r12, 0;
+        je  fileio_write_close;
+
+        // ---- (4) Per-line write loop. r13 = current 1-based addr. ----
+        mov r13, 1;
+
+      fileio_write_loop:
+        // (4a) Get pointer to slot r13's text.
+        mov rdi, r13;
+        call buffer_get_line_ptr;
+        // Stash pointer in the .bss scratch slot so we can survive the
+        // upcoming call buffer_get_line_len without a stack push/pop
+        // pair. Single-threaded editor -- no re-entrancy hazard.
+        mov [rip + fileio_scratch], rax;
+
+        // (4b) Get length of slot r13.
+        mov rdi, r13;
+        call buffer_get_line_len;
+        // rax = len; the pointer sits in [fileio_scratch].
+
+        // (4c) sys_write(fd, ptr, len) -- emit the line bytes.
+        mov rdi, rbx;                       // fd
+        mov rsi, [rip + fileio_scratch];    // buf = saved ptr
+        mov rdx, rax;                       // count = len
+        mov rax, 1;                         // SC+ ID 1 = sys_write
+        syscall;
+        cmp rax, 0;
+        jl  fileio_write_write_fail;
+
+        // (4d) sys_write(fd, "\n", 1) -- emit the trailing newline.
+        mov rdi, rbx;                       // fd
+        lea rsi, [rip + fileio_newline];    // buf = &"\n"
+        mov rdx, 1;                         // count = 1
+        mov rax, 1;                         // SC+ ID 1 = sys_write
+        syscall;
+        cmp rax, 0;
+        jl  fileio_write_write_fail;
+
+        // (4e) addr += 1; if addr <= count, loop.
+        add r13, 1;
+        cmp r13, r12;
+        jbe fileio_write_loop;
+
+      fileio_write_close:
+        // ---- (5) sys_close(fd). Return ignored per BSD cat posture. ----
+        mov rdi, rbx;                       // fd
+        mov rax, 3;                         // SC+ ID 3 = sys_close
+        syscall;
+
+        // ---- (5b) Return LINE_OK (0). Pop callee-saves. ----
+        xor rax, rax;                       // LINE_OK = 0
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      fileio_write_open_fail:
+        // No fd to close (open never succeeded). Sentinel + epilogue.
+        mov rax, 0xFFFFFFFFFFFFFF11;        // LINE_ERR_OPEN_FAIL
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      fileio_write_write_fail:
+        // fd is still open. Best-effort close before returning so the
+        // vnode slot is returned even on the error path (matches the
+        // line_write_err arm in main.pdx).
+        mov rdi, rbx;                       // fd
+        mov rax, 3;                         // SC+ ID 3 = sys_close
+        syscall;
+        mov rax, 0xFFFFFFFFFFFFFF12;        // LINE_ERR_WRITE_FAIL
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    } @no_frame
+
+  // ====================================================================
+  // fileio_read_file(path_ptr: u64) -> u64
+  //
+  // Reads `path` and appends every '\n'-terminated line into the Buffer
+  // module (each line becomes a new record via buffer_insert_line(count,
+  // ptr, len) -- appending at the tail). If the file does NOT end with
+  // '\n', the final chunk is inserted as one last line (no phantom
+  // empty line, no trailing-newline padding). Returns LINE_OK on
+  // success or the appropriate LINE_ERR_* sentinel on the first
+  // failure. See file header §"Trailing newline handling" for the
+  // round-trip contract vs fileio_write_buffer.
+  //
+  // Streaming discipline: reads into fileio_stream_buf (4 KiB) with a
+  // residual-shift protocol. Each iteration:
+  //   sys_read(fd, &buf + residual_len, 4096 - residual_len) -> n
+  //   total = residual_len + n
+  //   scan buf[0..total) for '\n':
+  //     line_start = 0
+  //     for i in 0..total:
+  //       if buf[i] == '\n':
+  //         buffer_insert_line(count, &buf + line_start, i - line_start)
+  //         line_start = i + 1
+  //   if n == 0 (EOF):                    -- final iteration
+  //     if line_start < total:
+  //       insert (&buf + line_start, total - line_start) as final line
+  //     return LINE_OK
+  //   else:
+  //     memmove(&buf, &buf + line_start, total - line_start)
+  //     residual_len = total - line_start
+  //     if residual_len == 4096:          -- no '\n' anywhere in a full
+  //       return LINE_ERR_READ_FAIL       -- 4 KiB chunk; next sys_read
+  //                                          would ask for 0 bytes and
+  //                                          we would spin forever.
+  //                                          Progress guard.
+  //     goto loop
+  //
+  // Register plan (five SysV callee-saves; 40 bytes on the stack; 8 +
+  // 40 = 48; 48 %16 == 0 at every nested `call` site):
+  //   rbx = fd            (survives sys_read + buffer_* calls)
+  //   r12 = residual_len  (bytes at start of buf carried from previous
+  //                        chunk; 0 on the first iteration)
+  //   r13 = line_start    (scan cursor's line origin, updated per '\n')
+  //   r14 = total         (residual_len + n, the scan upper bound)
+  //   r15 = i             (scan cursor's current byte index)
+  //
+  // Every buffer_insert_line call preserves r12..r15 + rbx per SysV
+  // callee-save (buffer.pdx entries are @no_frame + caller-save-only
+  // scratch). Every SYSCALL preserves the same set per amd64 fast-
+  // syscall (only rax, rcx, r11 clobbered).
+  // ====================================================================
+  pub let fileio_read_file : (u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (path_ptr: u64) -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {fs},
+      justification: "R63.M1-004 v1.3-A (paideia-os/line#4): open-read + '\\n'-split loop for the ed-style `e <path>` command. Sequence: (0) prologue push rbx / r12 / r13 / r14 / r15 (five SysV callee-save regs, 40 bytes -- brings rsp %16 to 0 at every nested `call` given the entry rsp %16 == 8 from the caller's `call fileio_read_file`; 8 + 40 = 48 == 0 mod 16). (1) sys_open(path, O_RDONLY = 0, mode = 0) via SC+ ID 2 -- rdi arrives with path_ptr (no reload); xor rsi/rdx (flags/mode = 0), rax = 2, syscall. fd-gate `cmp rax, 32; jae` -> LINE_ERR_OPEN_FAIL on failure; success stores fd in rbx. (2) r12 = 0 (residual_len at start of first iteration). (3) Outer read-loop top (fileio_read_top): sys_read(rbx, &buf + r12, 4096 - r12) via SC+ ID 0 -- rdi = rbx, lea rsi = fileio_stream_buf + r12, rdx = 4096 - r12, rax = 0, syscall. `cmp rax, 0; jl` catches -errno -> fileio_read_read_fail. Compute total = r12 + rax into r14. `cmp rax, 0; je fileio_read_eof` catches EOF. (4) Scan phase: r13 = 0 (line_start), r15 = 0 (i). fileio_read_scan_top: `cmp r15, r14; jae fileio_read_scan_done` exits when i >= total. Byte-load `xor rdx, rdx; lea rax, [rip + fileio_stream_buf]; add rax, r15; mov_b rdx, [rax]` (mov_b does not zero-extend on its own -- narrow-load precedent). `cmp rdx, 10; jne fileio_read_scan_next`. On newline: call buffer_last_addr (-> `after` count); rdi = rax; lea rsi = fileio_stream_buf + r13 (text_ptr); rdx = r15 - r13 (text_len); call buffer_insert_line. `cmp rax, 512; ja fileio_read_read_fail` catches every buffer.pdx sentinel (POOL_FULL / LINE_TOO_LONG / OOB) -- all have bit 63 set. line_start = i + 1 (r13 = r15; add r13, 1). fileio_read_scan_next: add r15, 1; jmp fileio_read_scan_top. (5) fileio_read_scan_done: n was > 0 (we would have branched to fileio_read_eof otherwise). memmove(&buf, &buf + r13, total - r13) as a plain byte-copy loop (source at-or-ahead of destination -- forward-copy safe; a line_start of 0 reduces the copy to a no-op which we tolerate rather than special-case): rsi = &buf + r13; rdi = &buf; rcx = r14 - r13; loop `xor rdx, rdx; mov_b rdx, [rsi]; mov [rdi], dl; add rsi, 1; add rdi, 1; sub rcx, 1; cmp rcx, 0; jne`. r12 = r14 - r13 (new residual_len). Progress guard: `cmp r12, 4096; jae fileio_read_read_fail` -- if the new residual fills the whole buffer, the next sys_read would ask for 0 bytes and we would spin forever on a chunk that never shrinks. That is the `single line >= 4 KiB with no '\\n'` case; report LINE_ERR_READ_FAIL. A partial read that consumed no '\\n' (say a 300-byte file with no terminator) falls THROUGH this guard (r12 = 300 < 4096) and reaches fileio_read_eof on the next iteration where sys_read returns 0; the EOF branch inserts the residual as a final unterminated line -- this is the round-trip contract with fileio_write_buffer's `every line always ends in '\\n'` posture. jmp fileio_read_top. (6) fileio_read_eof (sys_read returned 0): if r14 > 0 (any residual left over), insert (&buf, r14) as one final line via buffer_last_addr + buffer_insert_line + rax > 512 check (r13 is not read here -- the residual is always anchored at buf[0] because previous memmoves shifted it to the front, so the effective line_start for the EOF flush is 0). Otherwise (r14 == 0: empty file, or file ending cleanly on '\\n') no phantom empty line is inserted. (7) sys_close(rbx) via SC+ ID 3 (return ignored per BSD cat posture); xor rax, rax (LINE_OK); pop r15/r14/r13/r12/rbx; ret. (8) Error paths (fileio_read_open_fail: sentinel + epilogue; fileio_read_read_fail: close fd first, then sentinel + epilogue). Encoder posture identical to fileio_write_buffer -- no `test`, no `and reg, imm64`, no 2-op `imul`, no scaled-index, byte-load `xor rdx, rdx; mov_b rdx, [rN]`, byte-store `mov [rN], dl` (r/m8 form -- same as buffer.pdx's replace-line copy), reserved-label prefix `fileio_read_`, module basename Fileio matches filename fileio.pdx. All immediates fit imm32 (4096, 512, 32, 10, 1, 2, 3, 0); sentinels via movabs. Effects {mem, sysreg} + @{fs} matches the caller's declaration; buffer_* + buffer_last_addr + buffer_insert_line calls are pure !{mem} and compose additively.",
+      block: {
+        // ---- (0) Prologue: save callee-save registers. ----
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        // ---- (1) sys_open(path, O_RDONLY, 0). ----
+        // path_ptr arrived in rdi and survives the five pushes.
+        xor rsi, rsi;                       // flags = O_RDONLY = 0
+        xor rdx, rdx;                       // mode = 0 (ignored)
+        mov rax, 2;                         // SC+ ID 2 = sys_open
+        syscall;
+
+        // fd-gate: same [3, 32) range + negative-errno reject as write.
+        cmp rax, 32;
+        jae fileio_read_open_fail;
+        mov rbx, rax;                       // rbx = fd
+
+        // ---- (2) residual_len = 0 (first iteration reads full buf). ----
+        xor r12, r12;
+
+      fileio_read_top:
+        // ---- (3) sys_read(fd, &buf + residual_len, 4096 - residual_len). ----
+        mov rdi, rbx;                       // fd
+        lea rsi, [rip + fileio_stream_buf];
+        add rsi, r12;                       // buf + residual_len
+        mov rdx, 4096;
+        sub rdx, r12;                       // count = 4096 - residual_len
+        mov rax, 0;                         // SC+ ID 0 = sys_read
+        syscall;
+
+        // sys_read returns n >= 0 on success (0 = EOF) or -errno.
+        cmp rax, 0;
+        jl  fileio_read_read_fail;
+
+        // total = residual_len + n (into r14 for the scan bound).
+        mov r14, r12;
+        add r14, rax;
+
+        // n == 0 -> EOF branch (may still have residual to flush).
+        cmp rax, 0;
+        je  fileio_read_eof;
+
+        // ---- (4) Scan phase over buf[0..total) for '\n'. ----
+        xor r13, r13;                       // line_start = 0
+        xor r15, r15;                       // i = 0
+
+      fileio_read_scan_top:
+        cmp r15, r14;
+        jae fileio_read_scan_done;
+
+        // Byte-load buf[i] via narrow-load idiom.
+        lea rax, [rip + fileio_stream_buf];
+        add rax, r15;
+        xor rdx, rdx;
+        mov_b rdx, [rax];
+        cmp rdx, 10;                        // ASCII '\n'
+        jne fileio_read_scan_next;
+
+        // Found '\n' at index r15. Insert buf[line_start..i) as a line.
+        // (5) Compute insert params and call buffer_insert_line.
+        call buffer_last_addr;              // rax = count
+        mov rdi, rax;                       // after = count (append)
+        lea rsi, [rip + fileio_stream_buf];
+        add rsi, r13;                       // text_ptr = &buf + line_start
+        mov rdx, r15;
+        sub rdx, r13;                       // text_len = i - line_start
+        call buffer_insert_line;
+        cmp rax, 512;                       // >512 == bit-63-set sentinel
+        ja  fileio_read_read_fail;
+
+        // line_start = i + 1.
+        mov r13, r15;
+        add r13, 1;
+
+      fileio_read_scan_next:
+        add r15, 1;
+        jmp fileio_read_scan_top;
+
+      fileio_read_scan_done:
+        // n was > 0 here (n == 0 branched to fileio_read_eof above).
+        // memmove(&buf, &buf + line_start, total - line_start) shifts
+        // any trailing residual (bytes after the last '\n', or the
+        // whole chunk when no '\n' was found and we are still hoping
+        // more data will complete a line) to the front of the buffer.
+        // Source is at-or-ahead of destination (line_start >= 0), so
+        // forward byte-copy is safe. When line_start == 0 the copy
+        // reduces to a no-op (each byte written to its own address),
+        // which we tolerate rather than special-case: correctness beats
+        // the handful of cycles saved.
+        lea rsi, [rip + fileio_stream_buf];
+        add rsi, r13;                       // src = &buf + line_start
+        lea rdi, [rip + fileio_stream_buf]; // dst = &buf
+        mov rcx, r14;
+        sub rcx, r13;                       // len = total - line_start
+        // Update residual_len BEFORE the copy (rcx is the copy counter,
+        // r12 the persistent residual state).
+        mov r12, rcx;
+
+        // Progress guard: if the new residual fills the entire 4 KiB
+        // buffer, the next sys_read would ask for 0 bytes and we would
+        // spin forever on a chunk that never shrinks. This is the
+        // "single line >= 4 KiB with no '\n'" case; break the loop
+        // honestly with LINE_ERR_READ_FAIL. A residual of 4 KiB is
+        // also above the buffer.pdx per-line 256-byte cap, so an
+        // eventual insert-at-EOF would in any case bounce off
+        // BUFFER_ERR_LINE_TOO_LONG -- failing here reports the same
+        // condition one iteration earlier.
+        cmp r12, 4096;
+        jae fileio_read_read_fail;
+
+      fileio_read_memmove_top:
+        cmp rcx, 0;
+        je  fileio_read_memmove_done;
+        xor rdx, rdx;
+        mov_b rdx, [rsi];
+        mov [rdi], dl;
+        add rsi, 1;
+        add rdi, 1;
+        sub rcx, 1;
+        jmp fileio_read_memmove_top;
+      fileio_read_memmove_done:
+
+        jmp fileio_read_top;
+
+      fileio_read_eof:
+        // ---- (6) EOF handling: flush any residual as a final line. ----
+        // Here total is in r14 (residual_len + 0 = r12 on this branch);
+        // line_start is r13, which we did NOT initialise in this iteration
+        // (the scan phase was skipped because n == 0). But the residual
+        // that reached us started at buf[0], so the effective line_start
+        // for the EOF flush is 0 -- we treat the whole residual as one
+        // final unterminated line. Only fire the insert when r14 > 0,
+        // i.e. the file did not end at a clean chunk boundary AND had
+        // trailing bytes without a '\n'; when r14 == 0 (empty file, or
+        // file ending exactly on '\n' with no residual) we skip cleanly.
+        cmp r14, 0;
+        je  fileio_read_close;
+
+        call buffer_last_addr;              // rax = count
+        mov rdi, rax;                       // after = count (append)
+        lea rsi, [rip + fileio_stream_buf]; // text_ptr = &buf
+        mov rdx, r14;                       // text_len = total
+        call buffer_insert_line;
+        cmp rax, 512;
+        ja  fileio_read_read_fail;
+
+      fileio_read_close:
+        // ---- (7) sys_close(fd) + LINE_OK epilogue. ----
+        mov rdi, rbx;
+        mov rax, 3;                         // SC+ ID 3 = sys_close
+        syscall;
+
+        xor rax, rax;                       // LINE_OK = 0
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      fileio_read_open_fail:
+        // No fd to close.
+        mov rax, 0xFFFFFFFFFFFFFF11;        // LINE_ERR_OPEN_FAIL
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      fileio_read_read_fail:
+        // fd is still open. Best-effort close.
+        mov rdi, rbx;
+        mov rax, 3;                         // SC+ ID 3 = sys_close
+        syscall;
+        mov rax, 0xFFFFFFFFFFFFFF13;        // LINE_ERR_READ_FAIL
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    } @no_frame
+}

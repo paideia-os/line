@@ -43,6 +43,16 @@ sources:
                                   #   last_addr / cursor_get / cursor_set)
                                   #   backing the M1-002 grammar. Called from
                                   #   Main::_start at M1-005 dispatch.
+  - src/fileio.pdx                # M1-004 (v1.3-A): file I/O for the ed-style
+                                  #   `w <path>` (write buffer -> file) and
+                                  #   `e <path>` (read file -> buffer)
+                                  #   commands. Calls buffer_* entries in
+                                  #   src/buffer.pdx via cross-module `call`
+                                  #   symbol references (paideia-as resolves
+                                  #   by name; no `use` header required per
+                                  #   the shell.pdx / dispatch.pdx precedent).
+                                  #   Wired into Main::_start at M1-005 by
+                                  #   the interactive `:` dispatch layer.
 
 # --- Library dependencies ---------------------------------------------
 # v1.1-A pulls in zero libraries -- the four syscalls (read/write/open/

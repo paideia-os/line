@@ -6,6 +6,47 @@ All notable changes to `paideia-os/line` (ed-clone editor) documented per Keep-a
 
 ### Added
 
+- **v1.3-A** (issue #4) — R63.M1-004 file I/O (`src/fileio.pdx`, module
+  `Fileio`). Two public entry points backing the ed-style `w <path>`
+  (write buffer to file) and `e <path>` (read file into buffer) commands
+  that the M1-005 dispatch layer will wire to the interactive `:` prompt:
+  `fileio_write_buffer(path_ptr)` opens the target with
+  `O_CREAT|O_WRONLY|O_TRUNC` (flag word `0x241` = `0x40 | 0x01 | 0x200`,
+  mode `0644` = `0x1A4`) and emits every line via
+  `sys_write(fd, buffer_get_line_ptr(addr), buffer_get_line_len(addr))`
+  followed by `sys_write(fd, "\n", 1)` -- including the last line;
+  `fileio_read_file(path_ptr)` opens with `O_RDONLY` (`0`, mode `0`),
+  streams the file into a 4 KiB `fileio_stream_buf` (@align(8) .bss),
+  splits on `'\n'` (`0x0A`), and appends each complete line to the
+  Buffer module via `buffer_insert_line(buffer_last_addr(), ptr, len)`.
+  Residual bytes at the end of a chunk (no trailing `'\n'`) memmove to
+  the front and combine with the next `sys_read`; on EOF the trailing
+  residual (if any) is inserted as one final unterminated line -- so a
+  file ending in `'\n'` yields exactly N lines and a file without
+  trailing `'\n'` still preserves its final line. `fd`-gate `cmp rax,
+  32; jae` per the `ls.pdx` precedent (valid user fd in `[3, 32)`; any
+  bit-63-set negative-errno as unsigned dwarfs 32). Error sentinels in
+  the same `0xFFFFFFFFFFFFFF0N` band as `buffer.pdx`, in a disjoint
+  `0x11..0x13` sub-band so the M1-005 dispatch layer can pattern-match
+  the low byte back to the module of origin: `LINE_ERR_OPEN_FAIL`
+  (`0xFFFFFFFFFFFFFF11`), `LINE_ERR_WRITE_FAIL` (`0xFFFFFFFFFFFFFF12`),
+  `LINE_ERR_READ_FAIL` (`0xFFFFFFFFFFFFFF13`). On write failure the fd
+  is best-effort closed before returning the sentinel (matches
+  `main.pdx line_write_err` posture). Read failure additionally fires
+  when a single line spans a full 4 KiB chunk with no `'\n'`
+  (progress guard against infinite loop on adversarial input). SysV
+  callee-save discipline: `fileio_write_buffer` pushes `rbx/r12/r13`
+  (24 B, rsp %16 aligned at every nested `call`); `fileio_read_file`
+  pushes `rbx/r12/r13/r14/r15` (40 B, aligned). Both @no_frame with
+  manual push/pop matching `shell.pdx §shell_read_line` posture.
+  `buffer_*` cross-module calls resolved by name (no `use` header
+  required, per `dispatch.pdx` precedent). Not yet wired into
+  `Main::_start` -- M1-005 dispatch will call these from the `:`
+  prompt handlers. Encoder pitfall discipline v0.36+: no `test`, no
+  `and reg, imm64`, no 2-op `imul`, no scaled-index, byte-load
+  `xor rax, rax; mov_b rax, [rN]`, byte-store `mov [rN], dl`,
+  reserved-label prefix `fileio_`, module basename `Fileio` matches
+  filename `fileio.pdx`.
 - **v1.2-A** (issue #3) — R63.M1-003 line-array buffer state (`src/buffer.pdx`,
   module `Buffer`). Fixed pool of 512 lines * 256 bytes each (@align(8)
   .bss slabs `buffer_pool` + `buffer_len`; totals ~132 KiB per-process
