@@ -12,8 +12,9 @@ v1.1-D (R63.M1-006 fingerprint + LINE PARSE FAIL rodata) -- landed.
 v1.1-B (semantic-pipe emission wire: `LineEditRecord@0.1` via
 `sys_semantic_send` SC+ ID 115) -- landed. v1.1-A (syscall-wire;
 retired the M1-001 STUB body) -- landed.
-**Version:** 1.1.0-D (tag: `r63-closed`; a signed 1.0.0 release closes
-at M5).
+**Version:** 1.1.1 (v1.1.1 hygiene fix -- issue #11: `.gitignore` +
+untracked leaked `.o` build artifacts; no source/behavior change.
+Prior tag: `r63-closed`. A signed 1.0.0 release closes at M5).
 
 ## Milestone checklist
 

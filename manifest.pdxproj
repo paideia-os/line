@@ -19,7 +19,7 @@
 # noted in the CHANGELOG at the version bump.
 
 name        = line
-version     = 1.1.0
+version     = 1.1.1
 kind        = tool
 entry       = Main::_start
 output      = build-out/line

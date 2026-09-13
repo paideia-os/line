@@ -4,6 +4,20 @@ All notable changes to `paideia-os/line` (ed-clone editor) documented per Keep-a
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-09-13
+
+### Fixed
+
+- **Hygiene: `.gitignore` + leaked build artifacts** (issue #11).
+  `src/buffer.o`, `src/fileio.o`, `src/main.o` (loose ELF64 objects
+  emitted by `paideia-as build --emit elf64`) were tracked in git.
+  Added a repo-root `.gitignore` (`build-out/`, `*.o`, `*.bin`,
+  `*.elf`, `*.a`, `*~`, `.DS_Store`) and ran `git rm --cached` on the
+  three tracked `.o` files (working-tree copies untouched; a fresh
+  `bash tools/build.sh` regenerates them as untracked build output).
+  `manifest.pdxproj`: `version = 1.1.0` -> `version = 1.1.1`.
+  Closes #11.
+
 ### Added
 
 - **R63 round closure** (issue #7) — R63.M1-008 retrospective doc
