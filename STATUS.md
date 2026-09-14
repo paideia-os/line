@@ -12,9 +12,14 @@ v1.1-D (R63.M1-006 fingerprint + LINE PARSE FAIL rodata) -- landed.
 v1.1-B (semantic-pipe emission wire: `LineEditRecord@0.1` via
 `sys_semantic_send` SC+ ID 115) -- landed. v1.1-A (syscall-wire;
 retired the M1-001 STUB body) -- landed.
-**Version:** 1.1.1 (v1.1.1 hygiene fix -- issue #11: `.gitignore` +
-untracked leaked `.o` build artifacts; no source/behavior change.
-Prior tag: `r63-closed`. A signed 1.0.0 release closes at M5).
+**Version:** 1.2.0 (Wave III: closes stale tickets #1 (repo-bootstrap
+shape verification + `tools/build.sh`) and #2 (`src/line_grammar.pdx`,
+`Module LineGrammar` -- standalone grammar tokenizer + stub-handler
+dispatch) left open since before the R63 round even closed at
+`r63-closed`; see r63-closure.md §Ticket hygiene for the history.
+Prior: 1.1.1 (hygiene fix -- issue #11: `.gitignore` + untracked
+leaked `.o` build artifacts; no source/behavior change). A signed
+1.0.0 release closes at M5).
 
 ## Milestone checklist
 
@@ -25,7 +30,15 @@ Prior tag: `r63-closed`. A signed 1.0.0 release closes at M5).
       `sys_open(O_CREAT|O_WRONLY|O_TRUNC)` / `sys_write` / `sys_close`
       (write side); happy path emitted the fd-1 witness
       `line syscall-wire ok\n` before `sys_exit(0)` (retired at
-      v1.1-D). Landed at 3edfa6f.
+      v1.1-D). Landed at 3edfa6f. Repo-shape verification (Wave III,
+      v1.2.0): README.md / LICENSE / CHANGELOG.md were already
+      present from the initial commit; `tools/build.sh` was the one
+      missing piece relative to every sibling R100/R102 satellite in
+      this org (ping, pdxwatch, svc-compositor all ship one) -- added
+      at Wave III, compiling `src/*.pdx` to loose `build-out/*.o` via
+      `paideia-as build --emit elf64` (no final `ld` step; `line.elf`
+      is produced downstream by paideia-os#1868's `bin_seeds.pdx`
+      embed, not by this repo's own build script). Closes #1.
 - [x] **v1.1-B** -- semantic-pipe emission wire:
       `LineEditRecord@0.1` (56 bytes, schema tag
       `0x656E694C69644500` -- 8-byte ASCII `LineEdit` marker) emitted
@@ -40,11 +53,21 @@ Prior tag: `r63-closed`. A signed 1.0.0 release closes at M5).
       yet; M1-002 lands `a i d c p w q Q . , $`). Error paths emit
       NO record (no session to describe; matches pdxsock v1.1-B
       posture).
-- [x] **M1-002** -- command grammar `a i d c p w q Q . , $`. Landed
-      as part of the M1-005 REPL dispatch (tokenizer +
-      per-command handlers in `src/main.pdx`); ticket #2 remains
-      open on the tracker but the code is in-tree and downstream
-      landings built on it (see r63-closure.md §Ticket hygiene).
+- [x] **M1-002** -- command grammar `a i d c p w q Q . , $`. The REAL
+      grammar landed as part of the M1-005 REPL dispatch (tokenizer +
+      per-command handlers in `src/main.pdx`) well before ticket #2
+      itself closed -- see r63-closure.md §Ticket hygiene for that
+      gap. Wave III (v1.2.0) closes #2 for real: `src/line_grammar.pdx`
+      (`Module LineGrammar`) formalises the same grammar contract
+      (address forms `. $ N N,M ,`, command bytes `a i d c p w q Q`)
+      as its own independently testable, reusable unit --
+      `lg_parse_line` mirrors `main_parse_line`'s proven `mpl_`-labeled
+      tokenizer field-for-field, and `lg_dispatch_command` maps each
+      command byte to a documented STUB handler (per #2's own literal
+      text, "dispatch each to a stub handler") rather than duplicating
+      `main.pdx`'s already-real buffer/fileio mutations. NOT wired
+      into `Main::_start` -- see the file's own "Relationship to
+      Main's REPL" header section for why. Closes #2.
 - [x] **M1-003** (v1.2-A, issue #3) -- line-array buffer with
       1-based addresses + edit ops (`src/buffer.pdx`). Fixed pool
       of 512 lines * 256 bytes; API: `buffer_insert_line` /

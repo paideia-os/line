@@ -1,0 +1,624 @@
+// src/line_grammar.pdx -- line v1.2.0 (Wave III: R63.M1-002 / #2)
+// LineGrammar module: standalone ed-style command-line tokenizer +
+// dispatch-to-stub-handler table.
+//
+// ================================================================
+// Scope (per issue #2)
+// ================================================================
+//
+// "Implement the ed-style command grammar: a (append), i (insert),
+// d (delete), c (change), p (print), w (write), q/Q (quit/force-quit),
+// . (current line), , (range separator), $ (last line), plus a
+// general address-range parser (N,M, ., $, relative offsets), and
+// dispatch each to a stub handler." Wave III's dispatch consolidates
+// the issue's own suggested two-file split (`src/parser.pdx` +
+// `src/address.pdx`) into this single `src/line_grammar.pdx`.
+//
+// ================================================================
+// Relationship to Main's REPL (read this before touching main.pdx)
+// ================================================================
+//
+// `main.pdx`'s R63.M1-005 landing (`main_parse_line`, labels prefixed
+// `mpl_`) ALREADY ships a fully real, working, interactively-exercised
+// tokenizer for this exact grammar, wired end-to-end into `_start`'s
+// REPL loop and dispatching to real `buffer.pdx` / `fileio.pdx`
+// mutations -- not stubs. That landing closed R63.M1-005 (#5), which
+// subsumed #2's scope in practice (every documented address form and
+// command byte is parsed and dispatched for real there) while #2
+// itself stayed open on the tracker -- the same ticket-hygiene gap
+// `design/round-retrospectives/r63-closure.md` already called out for
+// #1/#2/#8 ("code landed, tickets stale").
+//
+// This module does NOT replace or get called from `main_parse_line`.
+// Rewiring a 1301-line, interactively-proven REPL to route through a
+// new module -- with no build harness available to this landing (see
+// tools/build.sh's own note: line has no `tests/` smoke harness) --
+// would risk regressing working, hand-verified control flow for a
+// purely cosmetic module boundary. Instead, `LineGrammar` formalises
+// the SAME grammar contract as its own independently testable,
+// reusable unit: the address+command tokenizer logic is mirrored
+// field-for-field from `main_parse_line`'s proven `mpl_`-labeled state
+// machine (same byte comparisons, same *10 decimal fold, same comma
+// shorthand rules), adapted to take an explicit (line_ptr, line_len)
+// pair and write an explicit `AddressSpec` output instead of reading/
+// writing `main.pdx`'s private `.bss` slots. Its command dispatch
+// intentionally calls STUB handlers (per the issue's own literal
+// text, "dispatch each to a stub handler") rather than real
+// buffer/fileio mutations -- `main_parse_line`'s dispatch already
+// owns those for real. A future closer that wants a single grammar
+// implementation shared by both the REPL and any other consumer
+// (a scripting mode, a `line -e` non-interactive flag, ...) should
+// retarget `main.pdx`'s dispatch to call THIS module's functions and
+// retire the `mpl_`/dispatch duplication -- tracked in STATUS.md, not
+// attempted here.
+//
+// ================================================================
+// Grammar (mirrors main.pdx's M1-005 "Grammar supported" table)
+// ================================================================
+//
+// Address forms (each independently resolvable for addr1 and addr2):
+//   .            current line       -> AddressSpec kind CURRENT
+//   $            last line          -> AddressSpec kind LAST
+//   <N>          decimal literal    -> AddressSpec kind NUMBER, value N
+//   <empty>      no address here    -> AddressSpec kind NONE
+//   <A1>,<A2>    range              -> addr1 = <A1>, addr2 = <A2>
+//   ,            bare comma         -> addr1 = NUMBER(1) (ed `,X` == `1,X`
+//                                       shorthand); if addr2 also absent,
+//                                       defaults to LAST (`,` == `1,$`)
+//
+// Note: unlike `main_parse_line` (which resolves '.'/'$' EAGERLY via
+// live `buffer_cursor_get`/`buffer_last_addr` calls, since it owns a
+// real buffer), this module has no buffer dependency and stays a pure
+// grammar layer: '.'/'$' are encoded as symbolic AddressSpec kinds
+// (CURRENT/LAST) for a caller with buffer context to resolve later,
+// not resolved to a concrete line number here.
+//
+// Command bytes (frozen set; anything else is LG_ERR_UNKNOWN_CMD):
+//   a i d c p w q Q
+//
+// ================================================================
+// AddressSpec output layout (40 bytes, written by lg_parse_line)
+// ================================================================
+//
+//   +0  addr1_kind   u64   LG_ADDR_KIND_{NONE,NUMBER,CURRENT,LAST}
+//   +8  addr1_value  u64   meaningful only when addr1_kind == NUMBER
+//   +16 addr2_kind   u64   same kind enum
+//   +24 addr2_value  u64   meaningful only when addr2_kind == NUMBER
+//   +32 cmd_byte     u64   the parsed command byte, or 0 if the line
+//                          ended before one was found
+//
+// ================================================================
+// Entry points
+// ================================================================
+//
+//   * lg_parse_line(line_ptr, line_len, out_spec_ptr) -> u64
+//       Tokenizes line_ptr[0..line_len) into *out_spec_ptr per the
+//       grammar above. Always returns LG_OK (0) at this landing --
+//       every address form is best-effort (a byte that matches
+//       neither '.', '$', nor a digit simply means "no address here",
+//       mirroring main_parse_line's own philosophy: address parsing
+//       never fails, only command dispatch can).
+//
+//   * lg_dispatch_command(cmd_byte, spec_ptr) -> u64
+//       Maps cmd_byte to one of the eight LG_CMD_* stub handlers and
+//       calls it with spec_ptr; returns LG_ERR_UNKNOWN_CMD for any
+//       byte outside {a,i,d,c,p,w,q,Q}. Split out from lg_parse_line
+//       specifically so a probe/future caller can exercise dispatch
+//       independent of tokenizing (and so tokenizing never itself
+//       fails on an unrecognized command byte -- ed's own convention,
+//       matching main.pdx's dispatch-owns-the-"?\n"-error posture).
+//
+//   * lg_parse_and_dispatch(line_ptr, line_len, out_spec_ptr) -> u64
+//       Convenience wrapper: lg_parse_line then
+//       lg_dispatch_command(spec.cmd_byte, out_spec_ptr). Returns the
+//       dispatch result.
+//
+//   * lg_stub_append / lg_stub_insert / lg_stub_delete / lg_stub_change /
+//     lg_stub_print / lg_stub_write / lg_stub_quit / lg_stub_quit_force
+//     (spec_ptr) -> u64
+//       Each a documented STUB per the issue's literal request: reads
+//       nothing, mutates nothing, always returns LG_OK. NOT wired to
+//       buffer.pdx/fileio.pdx (see "Relationship to Main's REPL"
+//       above for why real handlers already exist elsewhere).
+//
+// ================================================================
+// paideia-as compliance
+// ================================================================
+//   - Module LineGrammar (PascalCase of line_grammar.pdx stem).
+//   - No `test rN, rN`; zero-check via `cmp reg, 0`.
+//   - No `and rN, imm64`; no 2-op `imul r, imm` (the *10 decimal fold
+//     uses the `mov rbx,rcx; shl rcx,3; shl rbx,1; add rcx,rbx`
+//     shift-add pattern main_parse_line already proves, avoiding the
+//     banned mnemonic form entirely).
+//   - Byte-load idiom `xor rax, rax; mov_b rax, [rN]` throughout,
+//     matching main_parse_line verbatim.
+//   - `lg_parse_line` and `lg_parse_and_dispatch`'s tokenizer half
+//     make zero nested `call`s, so alignment is a non-issue.
+//     `lg_dispatch_command` pushes exactly ONE register (rbx, purely
+//     for alignment -- entry rsp %16 == 8; one 8-byte push brings it
+//     to %16 == 0 for its nested stub calls, the odd-push-count math
+//     sys_svc_lookup_body documents, unlike input_pump.pdx's own
+//     even-push precedent).
+//   - Reserved-label discipline: labels prefixed `lg_pl_` (parse_line)
+//     and `lg_dc_` (dispatch_command) -- function-scoped prefixes
+//     matching this repo's ACTUAL demonstrated convention
+//     (main.pdx's `mpl_`/`mrl_`/`line_pud_`), not the generic
+//     `reserved-label-prefix: line_` line in manifest.pdxproj's
+//     compliance-flags boilerplate.
+//   - `line` (the keyword `loop`, `if`, etc. reserved-label pitfall
+//     this org tracks org-wide) is not used as a bare label anywhere
+//     in this file.
+//
+// Upstream: design/roadmap/post-r60-daily-use-roadmap.md §R63
+// (paideia-os monorepo); this repo's #2 (R63.M1-002); src/main.pdx's
+// `main_parse_line` (mpl_-labeled precedent this module's tokenizer
+// mirrors); design/round-retrospectives/r63-closure.md (ticket-
+// hygiene note this landing closes out for #2).
+
+module LineGrammar = structure {
+
+  // ==========================================================================
+  // Constants
+  // ==========================================================================
+
+  pub let LG_OK               : u64 = 0
+  pub let LG_ERR_UNKNOWN_CMD  : u64 = 0xFFFFFFFFFFFFFFFE
+
+  pub let LG_ADDR_KIND_NONE    : u64 = 0
+  pub let LG_ADDR_KIND_NUMBER  : u64 = 1
+  pub let LG_ADDR_KIND_CURRENT : u64 = 2
+  pub let LG_ADDR_KIND_LAST    : u64 = 3
+
+  pub let LG_CMD_APPEND      : u64 = 0x61   // 'a'
+  pub let LG_CMD_INSERT      : u64 = 0x69   // 'i'
+  pub let LG_CMD_DELETE      : u64 = 0x64   // 'd'
+  pub let LG_CMD_CHANGE      : u64 = 0x63   // 'c'
+  pub let LG_CMD_PRINT       : u64 = 0x70   // 'p'
+  pub let LG_CMD_WRITE       : u64 = 0x77   // 'w'
+  pub let LG_CMD_QUIT        : u64 = 0x71   // 'q'
+  pub let LG_CMD_QUIT_FORCE  : u64 = 0x51   // 'Q'
+
+  pub let LG_SPEC_OFF_ADDR1_KIND  : u64 = 0
+  pub let LG_SPEC_OFF_ADDR1_VALUE : u64 = 8
+  pub let LG_SPEC_OFF_ADDR2_KIND  : u64 = 16
+  pub let LG_SPEC_OFF_ADDR2_VALUE : u64 = 24
+  pub let LG_SPEC_OFF_CMD_BYTE    : u64 = 32
+  pub let LG_SPEC_SIZE_BYTES      : u64 = 40
+
+  // ==========================================================================
+  // State -- private to lg_parse_line; a single in-flight parse at a
+  // time (matches main.pdx's own single-flow discipline).
+  // ==========================================================================
+
+  pub let mut _lg_line_ptr     : u64 = uninit @align(8)
+  pub let mut _lg_line_len     : u64 = uninit @align(8)
+  pub let mut _lg_pos          : u64 = uninit @align(8)
+  pub let mut _lg_addr1_kind   : u64 = uninit @align(8)
+  pub let mut _lg_addr1_val    : u64 = uninit @align(8)
+  pub let mut _lg_addr2_kind   : u64 = uninit @align(8)
+  pub let mut _lg_addr2_val    : u64 = uninit @align(8)
+  pub let mut _lg_cmd_byte     : u64 = uninit @align(8)
+  pub let mut _lg_out_spec_ptr : u64 = uninit @align(8)
+
+  // ==========================================================================
+  // lg_parse_line(line_ptr, line_len, out_spec_ptr) -> u64
+  //
+  // Mirrors main_parse_line's mpl_-labeled state machine verbatim
+  // (same byte comparisons, same *10 fold, same comma-shorthand
+  // rules), adapted to explicit args + an explicit AddressSpec output
+  // instead of main.pdx's private .bss REPL slots, and to symbolic
+  // CURRENT/LAST kinds instead of eager buffer_cursor_get/
+  // buffer_last_addr calls (this module has no buffer dependency).
+  // No nested `call` anywhere in this function -- alignment is a
+  // non-issue.
+  // ==========================================================================
+
+  pub let lg_parse_line : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (line_ptr: u64) (line_len: u64) (out_spec_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave III R63.M1-002 (#2): LineGrammar::lg_parse_line. Stashes the three args into _lg_line_ptr/_lg_line_len/_lg_out_spec_ptr (.bss, single-flow), zeroes every other parse-state slot, then runs the mpl_-precedent state machine relabeled lg_pl_: skip leading spaces; try addr1 as '.' (-> CURRENT), '$' (-> LAST), or a decimal run (fold via `mov rbx,rcx;shl rcx,3;shl rbx,1;add rcx,rbx;add rcx,rax` -- 10x=8x+2x, banned imul avoided) else NONE; optional ',' with the ed `,X`==`1,X` shorthand (addr1 defaults to NUMBER(1) if unset) then addr2 via the same three forms, defaulting to LAST if the comma has no explicit addr2 (`X,`==`X,$`, bare `,`==`1,$`); skip spaces; take one command byte (or leave cmd_byte=0 if the line ends first). Byte-load idiom `xor rax,rax;mov_b rax,[r9]` throughout, matching main_parse_line. Final block copies all five fields into *out_spec_ptr via `[r10+N]` stores. Always returns LG_OK (0) -- address parsing is best-effort by design, matching main_parse_line's own philosophy (only command dispatch, in lg_dispatch_command, can fail). No nested call anywhere in this function. Labels prefixed lg_pl_.",
+      block: {
+        mov [rip + _lg_line_ptr], rdi;
+        mov [rip + _lg_line_len], rsi;
+        mov [rip + _lg_out_spec_ptr], rdx;
+
+        xor rax, rax;
+        mov [rip + _lg_pos], rax;
+        mov [rip + _lg_addr1_kind], rax;
+        mov [rip + _lg_addr1_val], rax;
+        mov [rip + _lg_addr2_kind], rax;
+        mov [rip + _lg_addr2_val], rax;
+        mov [rip + _lg_cmd_byte], rax;
+
+        // ---- skip leading spaces ----
+      lg_pl_skip_lead:
+        mov r10, [rip + _lg_line_len];
+        mov r11, [rip + _lg_pos];
+        cmp r11, r10;
+        jae lg_pl_no_cmd;
+        mov r9, [rip + _lg_line_ptr];
+        add r9, r11;
+        xor rax, rax;
+        mov_b rax, [r9];
+        cmp rax, 0x20;
+        jne lg_pl_addr1_try;
+        add r11, 1;
+        mov [rip + _lg_pos], r11;
+        jmp lg_pl_skip_lead;
+
+        // ---- addr1: '.', '$', decimal, or NONE ----
+      lg_pl_addr1_try:
+        mov r11, [rip + _lg_pos];
+        mov r10, [rip + _lg_line_len];
+        cmp r11, r10;
+        jae lg_pl_no_cmd;
+        mov r9, [rip + _lg_line_ptr];
+        add r9, r11;
+        xor rax, rax;
+        mov_b rax, [r9];
+
+        cmp rax, 0x2E;                       // '.'
+        jne lg_pl_addr1_try_dollar;
+        mov rax, 2;                          // LG_ADDR_KIND_CURRENT
+        mov [rip + _lg_addr1_kind], rax;
+        add r11, 1;
+        mov [rip + _lg_pos], r11;
+        jmp lg_pl_comma_check;
+
+      lg_pl_addr1_try_dollar:
+        cmp rax, 0x24;                       // '$'
+        jne lg_pl_addr1_try_digit;
+        mov rax, 3;                          // LG_ADDR_KIND_LAST
+        mov [rip + _lg_addr1_kind], rax;
+        add r11, 1;
+        mov [rip + _lg_pos], r11;
+        jmp lg_pl_comma_check;
+
+      lg_pl_addr1_try_digit:
+        cmp rax, 0x30;                       // '0'
+        jl  lg_pl_comma_check;
+        cmp rax, 0x39;                       // '9'
+        ja  lg_pl_comma_check;
+
+        xor rcx, rcx;
+      lg_pl_addr1_digit_loop:
+        mov r10, [rip + _lg_line_len];
+        mov r11, [rip + _lg_pos];
+        cmp r11, r10;
+        jae lg_pl_addr1_digit_done;
+        mov r9, [rip + _lg_line_ptr];
+        add r9, r11;
+        xor rax, rax;
+        mov_b rax, [r9];
+        cmp rax, 0x30;
+        jl  lg_pl_addr1_digit_done;
+        cmp rax, 0x39;
+        ja  lg_pl_addr1_digit_done;
+        sub rax, 0x30;                       // digit value
+        mov rbx, rcx;
+        shl rcx, 3;
+        shl rbx, 1;
+        add rcx, rbx;
+        add rcx, rax;                        // rcx = rcx*10 + digit
+        add r11, 1;
+        mov [rip + _lg_pos], r11;
+        jmp lg_pl_addr1_digit_loop;
+      lg_pl_addr1_digit_done:
+        mov [rip + _lg_addr1_val], rcx;
+        mov rax, 1;                          // LG_ADDR_KIND_NUMBER
+        mov [rip + _lg_addr1_kind], rax;
+
+        // ---- optional ',' -> addr2 (with ed shorthand defaults) ----
+      lg_pl_comma_check:
+        mov r10, [rip + _lg_line_len];
+        mov r11, [rip + _lg_pos];
+        cmp r11, r10;
+        jae lg_pl_cmd_seek;
+        mov r9, [rip + _lg_line_ptr];
+        add r9, r11;
+        xor rax, rax;
+        mov_b rax, [r9];
+        cmp rax, 0x2C;                       // ','
+        jne lg_pl_cmd_seek;
+
+        add r11, 1;
+        mov [rip + _lg_pos], r11;
+
+        mov rax, [rip + _lg_addr1_kind];
+        cmp rax, 0;                          // LG_ADDR_KIND_NONE
+        jne lg_pl_addr2_try;
+        mov rax, 1;                          // LG_ADDR_KIND_NUMBER
+        mov [rip + _lg_addr1_kind], rax;
+        mov rax, 1;
+        mov [rip + _lg_addr1_val], rax;      // ed `,X` == `1,X`
+
+      lg_pl_addr2_try:
+        mov r10, [rip + _lg_line_len];
+        mov r11, [rip + _lg_pos];
+        cmp r11, r10;
+        jae lg_pl_addr2_default;
+        mov r9, [rip + _lg_line_ptr];
+        add r9, r11;
+        xor rax, rax;
+        mov_b rax, [r9];
+
+        cmp rax, 0x2E;                       // '.'
+        jne lg_pl_addr2_try_dollar;
+        mov rax, 2;                          // LG_ADDR_KIND_CURRENT
+        mov [rip + _lg_addr2_kind], rax;
+        add r11, 1;
+        mov [rip + _lg_pos], r11;
+        jmp lg_pl_cmd_seek;
+
+      lg_pl_addr2_try_dollar:
+        cmp rax, 0x24;                       // '$'
+        jne lg_pl_addr2_try_digit;
+        mov rax, 3;                          // LG_ADDR_KIND_LAST
+        mov [rip + _lg_addr2_kind], rax;
+        add r11, 1;
+        mov [rip + _lg_pos], r11;
+        jmp lg_pl_cmd_seek;
+
+      lg_pl_addr2_try_digit:
+        cmp rax, 0x30;
+        jl  lg_pl_addr2_default;
+        cmp rax, 0x39;
+        ja  lg_pl_addr2_default;
+
+        xor rcx, rcx;
+      lg_pl_addr2_digit_loop:
+        mov r10, [rip + _lg_line_len];
+        mov r11, [rip + _lg_pos];
+        cmp r11, r10;
+        jae lg_pl_addr2_digit_done;
+        mov r9, [rip + _lg_line_ptr];
+        add r9, r11;
+        xor rax, rax;
+        mov_b rax, [r9];
+        cmp rax, 0x30;
+        jl  lg_pl_addr2_digit_done;
+        cmp rax, 0x39;
+        ja  lg_pl_addr2_digit_done;
+        sub rax, 0x30;
+        mov rbx, rcx;
+        shl rcx, 3;
+        shl rbx, 1;
+        add rcx, rbx;
+        add rcx, rax;
+        add r11, 1;
+        mov [rip + _lg_pos], r11;
+        jmp lg_pl_addr2_digit_loop;
+      lg_pl_addr2_digit_done:
+        mov [rip + _lg_addr2_val], rcx;
+        mov rax, 1;                          // LG_ADDR_KIND_NUMBER
+        mov [rip + _lg_addr2_kind], rax;
+        jmp lg_pl_cmd_seek;
+
+      lg_pl_addr2_default:
+        // Trailing ',' with no explicit addr2: ed `X,` == `X,$`.
+        mov rax, 3;                          // LG_ADDR_KIND_LAST
+        mov [rip + _lg_addr2_kind], rax;
+
+        // ---- skip spaces, take one command byte ----
+      lg_pl_cmd_seek:
+      lg_pl_cmd_skip:
+        mov r10, [rip + _lg_line_len];
+        mov r11, [rip + _lg_pos];
+        cmp r11, r10;
+        jae lg_pl_no_cmd;
+        mov r9, [rip + _lg_line_ptr];
+        add r9, r11;
+        xor rax, rax;
+        mov_b rax, [r9];
+        cmp rax, 0x20;
+        jne lg_pl_cmd_take;
+        add r11, 1;
+        mov [rip + _lg_pos], r11;
+        jmp lg_pl_cmd_skip;
+
+      lg_pl_cmd_take:
+        mov [rip + _lg_cmd_byte], rax;
+        add r11, 1;
+        mov [rip + _lg_pos], r11;
+        jmp lg_pl_finish;
+
+      lg_pl_no_cmd:
+        // Line ended before a command byte; _lg_cmd_byte stays 0.
+
+      lg_pl_finish:
+        mov r10, [rip + _lg_out_spec_ptr];
+        mov rax, [rip + _lg_addr1_kind];
+        mov [r10 + 0], rax;
+        mov rax, [rip + _lg_addr1_val];
+        mov [r10 + 8], rax;
+        mov rax, [rip + _lg_addr2_kind];
+        mov [r10 + 16], rax;
+        mov rax, [rip + _lg_addr2_val];
+        mov [r10 + 24], rax;
+        mov rax, [rip + _lg_cmd_byte];
+        mov [r10 + 32], rax;
+
+        xor rax, rax;                        // LG_OK
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // lg_dispatch_command(cmd_byte, spec_ptr) -> u64
+  //
+  // Register plan: 1 callee-save push (rbx = spec_ptr, survives every
+  // stub call). Entry rsp %16 == 8; one push brings it to %16 == 0
+  // immediately before each nested `call` -- the odd-push-count
+  // alignment math sys_svc_lookup_body documents.
+  // ==========================================================================
+
+  pub let lg_dispatch_command : (u64, u64) -> u64 !{mem} @{} =
+    fn (cmd_byte: u64) (spec_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave III R63.M1-002 (#2): LineGrammar::lg_dispatch_command. Copies cmd_byte into rax (comparisons) and spec_ptr into rbx (survives every nested stub call). Eight `cmp rax,<byte>;je <label>` branches for a/i/d/c/p/w/q/Q (LG_CMD_* literals); no match falls through to lg_dc_unknown (rax = LG_ERR_UNKNOWN_CMD = 0xFFFFFFFFFFFFFFFE). Each matched branch sets rdi=rbx (spec_ptr) and calls the corresponding lg_stub_* handler, then jumps to the common epilogue. 1 callee-save push (rbx) aligns rsp %16==0 for the nested calls (entry rsp%16==8; one 8-byte push -> 0). Labels prefixed lg_dc_.",
+      block: {
+        push rbx;
+
+        mov rax, rdi;                        // rax = cmd_byte (comparisons)
+        mov rbx, rsi;                        // rbx = spec_ptr (survives calls)
+
+        cmp rax, 0x61;                       // 'a'
+        je  lg_dc_append;
+        cmp rax, 0x69;                       // 'i'
+        je  lg_dc_insert;
+        cmp rax, 0x64;                       // 'd'
+        je  lg_dc_delete;
+        cmp rax, 0x63;                       // 'c'
+        je  lg_dc_change;
+        cmp rax, 0x70;                       // 'p'
+        je  lg_dc_print;
+        cmp rax, 0x77;                       // 'w'
+        je  lg_dc_write;
+        cmp rax, 0x71;                       // 'q'
+        je  lg_dc_quit;
+        cmp rax, 0x51;                       // 'Q'
+        je  lg_dc_quit_force;
+        jmp lg_dc_unknown;
+
+      lg_dc_append:
+        mov rdi, rbx;
+        call lg_stub_append;
+        jmp lg_dc_out;
+
+      lg_dc_insert:
+        mov rdi, rbx;
+        call lg_stub_insert;
+        jmp lg_dc_out;
+
+      lg_dc_delete:
+        mov rdi, rbx;
+        call lg_stub_delete;
+        jmp lg_dc_out;
+
+      lg_dc_change:
+        mov rdi, rbx;
+        call lg_stub_change;
+        jmp lg_dc_out;
+
+      lg_dc_print:
+        mov rdi, rbx;
+        call lg_stub_print;
+        jmp lg_dc_out;
+
+      lg_dc_write:
+        mov rdi, rbx;
+        call lg_stub_write;
+        jmp lg_dc_out;
+
+      lg_dc_quit:
+        mov rdi, rbx;
+        call lg_stub_quit;
+        jmp lg_dc_out;
+
+      lg_dc_quit_force:
+        mov rdi, rbx;
+        call lg_stub_quit_force;
+        jmp lg_dc_out;
+
+      lg_dc_unknown:
+        mov rax, 0xFFFFFFFFFFFFFFFE;         // LG_ERR_UNKNOWN_CMD
+
+      lg_dc_out:
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // lg_parse_and_dispatch(line_ptr, line_len, out_spec_ptr) -> u64
+  //
+  // Register plan: 1 callee-save push (rbx = out_spec_ptr, survives
+  // both nested calls). Entry rsp%16==8; one push -> 0.
+  // ==========================================================================
+
+  pub let lg_parse_and_dispatch : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (line_ptr: u64) (line_len: u64) (out_spec_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave III R63.M1-002 (#2): LineGrammar::lg_parse_and_dispatch. Convenience wrapper: stashes out_spec_ptr in rbx (survives both nested calls), calls lg_parse_line(line_ptr, line_len, out_spec_ptr) with the incoming args passed straight through (rdi/rsi/rdx already hold them), reloads cmd_byte from *out_spec_ptr+32 (rbx), then calls lg_dispatch_command(cmd_byte, out_spec_ptr). Returns the dispatch result verbatim. 1 callee-save push (rbx) aligns rsp%16==0 for both nested calls. Labels: none needed (straight-line).",
+      block: {
+        push rbx;
+
+        mov rbx, rdx;                        // rbx = out_spec_ptr (survives both calls)
+
+        call lg_parse_line;                  // rdi/rsi/rdx already (line_ptr, line_len, out_spec_ptr)
+
+        mov rax, [rbx + 32];                 // cmd_byte (LG_SPEC_OFF_CMD_BYTE)
+        mov rdi, rax;
+        mov rsi, rbx;
+        call lg_dispatch_command;
+
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // Stub command handlers -- per issue #2's literal text, "dispatch
+  // each to a stub handler". Each reads nothing, mutates nothing,
+  // always returns LG_OK. NOT wired to buffer.pdx/fileio.pdx -- see
+  // the file header's "Relationship to Main's REPL" section for why
+  // real handlers for this grammar already exist elsewhere.
+  // ==========================================================================
+
+  pub let lg_stub_append : (u64) -> u64 !{mem} @{} =
+    fn (spec_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave III R63.M1-002 (#2): LineGrammar::lg_stub_append. Documented STUB (issue #2's own text) -- touches nothing, always returns LG_OK. Real `a` handling lives in main.pdx's M1-005 dispatch (buffer_insert_line).",
+      block: { xor rax, rax; ret }
+    }
+
+  pub let lg_stub_insert : (u64) -> u64 !{mem} @{} =
+    fn (spec_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave III R63.M1-002 (#2): LineGrammar::lg_stub_insert. Documented STUB -- touches nothing, always returns LG_OK. Real `i` handling lives in main.pdx's M1-005 dispatch (buffer_insert_line).",
+      block: { xor rax, rax; ret }
+    }
+
+  pub let lg_stub_delete : (u64) -> u64 !{mem} @{} =
+    fn (spec_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave III R63.M1-002 (#2): LineGrammar::lg_stub_delete. Documented STUB -- touches nothing, always returns LG_OK. Real `d` handling lives in main.pdx's M1-005 dispatch (buffer_delete_line).",
+      block: { xor rax, rax; ret }
+    }
+
+  pub let lg_stub_change : (u64) -> u64 !{mem} @{} =
+    fn (spec_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave III R63.M1-002 (#2): LineGrammar::lg_stub_change. Documented STUB -- touches nothing, always returns LG_OK. Real `c` handling lives in main.pdx's M1-005 dispatch (delete range + insert-mode).",
+      block: { xor rax, rax; ret }
+    }
+
+  pub let lg_stub_print : (u64) -> u64 !{mem} @{} =
+    fn (spec_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave III R63.M1-002 (#2): LineGrammar::lg_stub_print. Documented STUB -- touches nothing, always returns LG_OK. Real `p` handling lives in main.pdx's M1-005 dispatch (buffer_get_line_ptr/get_line_len + sys_write).",
+      block: { xor rax, rax; ret }
+    }
+
+  pub let lg_stub_write : (u64) -> u64 !{mem} @{} =
+    fn (spec_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave III R63.M1-002 (#2): LineGrammar::lg_stub_write. Documented STUB -- touches nothing, always returns LG_OK. Real `w` handling lives in main.pdx's M1-005 dispatch (fileio_write_buffer).",
+      block: { xor rax, rax; ret }
+    }
+
+  pub let lg_stub_quit : (u64) -> u64 !{mem} @{} =
+    fn (spec_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave III R63.M1-002 (#2): LineGrammar::lg_stub_quit. Documented STUB -- touches nothing, always returns LG_OK. Real `q` handling lives in main.pdx's M1-005 dispatch (fingerprint + LineEditRecord emission + sys_exit(0)).",
+      block: { xor rax, rax; ret }
+    }
+
+  pub let lg_stub_quit_force : (u64) -> u64 !{mem} @{} =
+    fn (spec_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave III R63.M1-002 (#2): LineGrammar::lg_stub_quit_force. Documented STUB -- touches nothing, always returns LG_OK. Real `Q` handling lives in main.pdx's M1-005 dispatch (sys_exit(0), no emit).",
+      block: { xor rax, rax; ret }
+    }
+
+}

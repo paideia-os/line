@@ -4,6 +4,41 @@ All notable changes to `paideia-os/line` (ed-clone editor) documented per Keep-a
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-09-13
+
+Wave III: closes stale tracker tickets #1 and #2, both left open
+since before the R63 round closed at `r63-closed` even though the
+functionality each named had, by then, already landed under other
+issue numbers (see `design/round-retrospectives/r63-closure.md`
+§Ticket hygiene).
+
+### Added
+
+- **`tools/build.sh`** (issue #1). `line` shipped README.md, LICENSE,
+  CHANGELOG.md, and `manifest.pdxproj` from its first commit, but
+  never a self-contained build script of its own -- every sibling
+  R100/R102 satellite in this org (`ping`, `pdxwatch`,
+  `svc-compositor`, ...) ships one. Added, mirroring `pdxwatch`'s
+  `tools/build.sh` (loose `build-out/*.o` objects via `paideia-as
+  build --emit elf64`, no final `ld` step -- `line.elf` is produced
+  downstream by `paideia-os#1868`'s `bin_seeds.pdx` embed, not by
+  this repo). Closes #1.
+- **`src/line_grammar.pdx`** (issue #2). `Module LineGrammar`: a
+  standalone ed-style grammar tokenizer (`lg_parse_line`) supporting
+  address forms `.` `$` `N` `N,M` and the bare-`,` shorthand (`1,$`),
+  plus a dispatch table (`lg_dispatch_command`) mapping each of the
+  eight frozen command bytes (`a i d c p w q Q`) to a documented STUB
+  handler, per the issue's own literal text ("dispatch each to a stub
+  handler"). `lg_parse_line`'s tokenizer mirrors `main.pdx`'s already-
+  real, interactively-proven `main_parse_line` (`mpl_`-labeled state
+  machine) field-for-field, rather than duplicating its real
+  buffer/fileio dispatch -- `main.pdx`'s M1-005 REPL already owns
+  that. NOT wired into `Main::_start`; see the new file's own
+  "Relationship to Main's REPL" header section for the full rationale
+  and a note on the retargeting a future closer could do. Closes #2.
+- `manifest.pdxproj`: `sources:` gains `src/line_grammar.pdx`;
+  `version = 1.1.1` -> `version = 1.2.0`.
+
 ## [1.1.1] - 2026-09-13
 
 ### Fixed

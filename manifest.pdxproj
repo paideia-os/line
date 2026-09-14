@@ -19,7 +19,7 @@
 # noted in the CHANGELOG at the version bump.
 
 name        = line
-version     = 1.1.1
+version     = 1.2.0
 kind        = tool
 entry       = Main::_start
 output      = build-out/line
@@ -53,6 +53,20 @@ sources:
                                   #   the shell.pdx / dispatch.pdx precedent).
                                   #   Wired into Main::_start at M1-005 by
                                   #   the interactive `:` dispatch layer.
+  - src/line_grammar.pdx          # M1-002 (Wave III): standalone LineGrammar
+                                  #   module -- ed-style address+command
+                                  #   tokenizer (lg_parse_line) and a
+                                  #   dispatch-to-stub-handler table
+                                  #   (lg_dispatch_command). NOT wired into
+                                  #   Main::_start -- main.pdx's own M1-005
+                                  #   REPL already has a fully real, working
+                                  #   inline tokenizer + dispatch to
+                                  #   buffer.pdx/fileio.pdx (mpl_* labels in
+                                  #   main_parse_line). This module formalises
+                                  #   the same grammar contract as an
+                                  #   independently testable, reusable unit;
+                                  #   see the file's own header for the full
+                                  #   "Relationship to Main's REPL" note.
 
 # --- Library dependencies ---------------------------------------------
 # v1.1-A pulls in zero libraries -- the four syscalls (read/write/open/
